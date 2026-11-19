@@ -1,4 +1,4 @@
-var CACHE = 'vendes-scan-v5';
+var CACHE = 'vendes-scan-v6';
 var SHELL = [
   './',
   './index.html',

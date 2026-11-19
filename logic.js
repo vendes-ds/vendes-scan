@@ -87,7 +87,8 @@
     SKIP_DISPATCH: 'Stage skipped — pack before dispatch',
     NOT_PICKED: 'Not picked yet',
     NOT_PACKED_OR_PICKED: 'Not packed yet / not picked yet',
-    NOT_PACKED: 'Not fully packed',
+    NOT_PACKED: 'Not packed yet',
+    ITEM_NOT_IN_LIST: 'Item not in list: ',
     UNKNOWN_WB: 'Unknown waybill — not on the list',
     ALREADY_DISPATCHED: 'Already dispatched',
     PICKED_UP: 'Already picked up by the J&T rider',
@@ -134,7 +135,11 @@
   }
 
   function normalizeSku(value) {
-    return String(value == null ? '' : value).trim().toUpperCase();
+    return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().toUpperCase();
+  }
+
+  function normHeader(value) {
+    return String(value == null ? '' : value).toLowerCase().replace(/&/g, '').replace(/[^a-z0-9]+/g, '');
   }
 
   function normalizeClient(value) {
@@ -312,30 +317,52 @@
     return out;
   }
 
-  function tryParseCompact(text) {
+  function parseItemSegments(text) {
     var raw = String(text || '').trim();
-    if (!raw) return null;
-    var parts = raw.split('+');
+    if (!raw) return [];
+    var parts = raw.split(/\s*(?:\+|\;|\||\n|\r)+\s*/);
     var out = [];
-    for (var i = 0; i < parts.length; i++) {
-      var part = parts[i].trim();
-      if (!part) return null;
-      var withQty = part.match(/^(\d+)\s*x\s*([A-Za-z0-9][A-Za-z0-9._\-]*)$/i);
-      if (withQty) {
-        out.push({ sku: normalizeSku(withQty[2]), qty: clampQty(withQty[1]) });
-        continue;
+    parts.forEach(function (part) {
+      var token = String(part || '').replace(/\s+/g, ' ').trim();
+      if (!token) return;
+      var lead = token.match(/^(\d+)\s*x\s*(.+)$/i);
+      if (lead) {
+        out.push({ name: lead[2].trim(), qty: clampQty(lead[1]) });
+        return;
       }
-      if (/^[A-Za-z0-9][A-Za-z0-9._\-]*$/.test(part)) {
-        out.push({ sku: normalizeSku(part), qty: 1 });
-        continue;
+      var pcs = token.match(/^(\d+)\s*(?:pcs|pc|pieces|piece|sets|set)\s+(.+)$/i);
+      if (pcs) {
+        out.push({ name: pcs[2].trim(), qty: clampQty(pcs[1]) });
+        return;
       }
-      return null;
-    }
-    return out.length ? mergeQty(out) : null;
+      var trail = token.match(/^(.+?)\s*x\s*(\d+)$/i);
+      if (trail) {
+        out.push({ name: trail[1].trim(), qty: clampQty(trail[2]) });
+        return;
+      }
+      var pcsAfter = token.match(/^(.+?)\s+(\d+)\s*(?:pcs|pc|pieces|piece|sets|set)$/i);
+      if (pcsAfter) {
+        out.push({ name: pcsAfter[1].trim(), qty: clampQty(pcsAfter[2]) });
+        return;
+      }
+      out.push({ name: token, qty: 1 });
+    });
+    return out;
+  }
+
+  function tryParseCompact(text) {
+    var segments = parseItemSegments(text);
+    if (!segments.length) return null;
+    return mergeQty(segments.map(function (seg) {
+      return { sku: normalizeSku(seg.name), qty: seg.qty, client: '', name: '' };
+    }));
   }
 
   function parseItemString(text) {
-    return tryParseCompact(text) || [];
+    var segments = parseItemSegments(text);
+    return segments.map(function (seg) {
+      return { sku: normalizeSku(seg.name), qty: seg.qty, client: '', name: '' };
+    });
   }
 
   function formatItemString(items) {
@@ -426,122 +453,124 @@
     return keys.length === 1 ? keys[0] : '';
   }
 
-  /**
-   * Turn J&T item text into official SKUs.
-   * Compact form "2xWVT-LW+1xFTB-QUEEN" wins when the whole cell matches.
-   * Otherwise Raw Text entries in SKU_MAP are matched longest-first,
-   * then bare SKU codes that appear as their own word.
-   */
-  function resolveLineItems(rawText, clientHint, skuMap, items) {
-    var text = String(rawText || '').trim();
-    var hint = normalizeClient(clientHint);
-    if (!text) {
-      return { items: [], unknown: [], client: hint, itemString: '' };
-    }
-
-    var compact = tryParseCompact(text);
-    if (compact) {
-      var resolved = [];
-      var unknown = [];
-      compact.forEach(function (part) {
-        var item = findItem(items, part.sku, hint);
-        if (!item || item.ambiguous) {
-          unknown.push(part.sku);
-          return;
-        }
-        resolved.push({
-          sku: normalizeSku(item.sku),
-          qty: part.qty,
-          client: normalizeClient(item.client),
-          name: item.productName || ''
-        });
-      });
-      var compactClient = hint || onlyClient(resolved);
-      return {
-        items: mergeQty(resolved),
-        unknown: unknown,
-        client: compactClient || '',
-        itemString: resolved.length ? formatItemString(resolved) : text
-      };
-    }
-
-    var working = ' ' + text.toLowerCase() + ' ';
-    var found = [];
-    var maps = (skuMap || []).filter(function (entry) {
-      if (!entry || !String(entry.raw || '').trim()) return false;
-      if (hint && entry.client && normalizeClient(entry.client) !== hint) return false;
-      return true;
-    }).sort(function (a, b) {
-      return String(b.raw).trim().length - String(a.raw).trim().length;
-    });
-
-    maps.forEach(function (entry) {
-      var needle = String(entry.raw).trim().toLowerCase();
-      var at = working.indexOf(needle);
-      if (at < 0) return;
-      var item = findItem(items, entry.sku, hint || entry.client);
-      var qty = qtyNear(text, needle);
-      if (!item || item.ambiguous) {
-        found.push({ sku: normalizeSku(entry.sku), qty: qty, client: normalizeClient(entry.client), missing: true });
+  function formatSegments(segments) {
+    var out = [];
+    var index = {};
+    (segments || []).forEach(function (seg) {
+      var label = seg.unknown ? String(seg.name || '').replace(/\s+/g, ' ').trim() : seg.sku;
+      if (!label) return;
+      var key = (seg.unknown ? '?' : '=') + normalizeSku(label);
+      if (index[key] == null) {
+        index[key] = out.length;
+        out.push({ label: label, qty: clampQty(seg.qty) });
       } else {
-        found.push({
-          sku: normalizeSku(item.sku),
-          qty: qty,
-          client: normalizeClient(item.client),
-          name: item.productName || ''
-        });
+        out[index[key]].qty = Math.min(999, out[index[key]].qty + clampQty(seg.qty));
       }
-      working = blankRange(working, at, needle.length);
     });
+    return out.map(function (row) { return row.qty + 'x' + row.label; }).join('+');
+  }
 
-    var skuCandidates = (items || []).filter(function (item) {
+  function unknownSegment(name, qty) {
+    return {
+      sku: '',
+      qty: clampQty(qty),
+      client: '',
+      name: String(name || '').replace(/\s+/g, ' ').trim(),
+      unknown: true
+    };
+  }
+
+  /**
+   * One whole segment becomes one SKU, or stays unknown with its own qty.
+   * Order: exact SKU, exact J&T Alias, exact Product Name. Same client only.
+   * A shorter word inside the name is not a match.
+   */
+  function resolveSegment(name, qty, client, items) {
+    var label = normalizeSku(name);
+    var hint = normalizeClient(client);
+    if (!label) return unknownSegment(name, qty);
+    var pool = (items || []).filter(function (item) {
       if (!isActiveItem(item)) return false;
       if (hint && normalizeClient(item.client) !== hint) return false;
       return true;
-    }).sort(function (a, b) {
-      return String(b.sku).length - String(a.sku).length;
     });
-
-    skuCandidates.forEach(function (item) {
-      var sku = normalizeSku(item.sku);
-      if (found.some(function (row) { return row.sku === sku; })) return;
-      var at = findSkuMention(working, sku);
-      if (at < 0) return;
-      found.push({
-        sku: sku,
-        qty: qtyNear(text, sku),
-        client: normalizeClient(item.client),
-        name: item.productName || ''
-      });
-      working = blankRange(working, at, sku.length);
-    });
-
-    var unknown = [];
-    found.forEach(function (row) {
-      if (row.missing) unknown.push(row.sku);
-    });
-    if (!found.length) {
-      unknown = unknown.concat(leftoverPhrase(text) );
-      if (!unknown.length) unknown = [text];
-    } else {
-      unknown = unknown.concat(leftoverPhrase(working));
+    function hit(row) {
+      return {
+        sku: normalizeSku(row.sku),
+        qty: clampQty(qty),
+        client: normalizeClient(row.client),
+        name: row.productName || '',
+        unknown: false
+      };
     }
-
-    var good = found.filter(function (row) { return !row.missing; });
-    var seenUnknown = {};
-    unknown = unknown.filter(function (entry) {
-      var key = String(entry);
-      if (!key || seenUnknown[key]) return false;
-      seenUnknown[key] = true;
-      return true;
+    var bySku = pool.filter(function (item) { return normalizeSku(item.sku) === label; });
+    if (bySku.length === 1) return hit(bySku[0]);
+    var byAlias = pool.filter(function (item) {
+      return aliasList(item.jtAlias).some(function (alias) { return normalizeSku(alias) === label; });
     });
+    if (byAlias.length === 1) return hit(byAlias[0]);
+    var byName = pool.filter(function (item) {
+      return normalizeSku(item.productName) === label;
+    });
+    if (byName.length === 1) return hit(byName[0]);
+    return unknownSegment(name, qty);
+  }
 
+  function resolveLineItems(rawText, clientHint, skuMap, items) {
+    var hint = normalizeClient(clientHint);
+    var segments = parseItemSegments(rawText);
+    if (!segments.length) {
+      return { items: [], unknown: [], segments: [], client: hint, itemString: '' };
+    }
+    var resolved = segments.map(function (seg) {
+      return resolveSegment(seg.name, seg.qty, hint, items);
+    });
+    var good = resolved.filter(function (row) { return !row.unknown; });
+    var unknown = [];
+    var seen = {};
+    resolved.forEach(function (row) {
+      if (!row.unknown) return;
+      var key = normalizeSku(row.name);
+      if (!key || seen[key]) return;
+      seen[key] = true;
+      unknown.push(row.name);
+    });
     return {
       items: mergeQty(good),
       unknown: unknown,
+      segments: resolved,
       client: hint || onlyClient(good) || '',
-      itemString: good.length ? formatItemString(good) : text
+      itemString: formatSegments(resolved)
     };
+  }
+
+  function unknownItemMessage(view) {
+    var names = [];
+    var seen = {};
+    ((view && view.lines) || []).forEach(function (line) {
+      if (!line || !line.unknown) return;
+      var name = String(line.name || line.sku || '').replace(/\s+/g, ' ').trim();
+      var key = normalizeSku(name);
+      if (!key || seen[key]) return;
+      seen[key] = true;
+      names.push(name);
+    });
+    if (!names.length && view && String(view.unmapped || '').trim()) {
+      String(view.unmapped).split(',').forEach(function (part) {
+        var name = part.replace(/\s+/g, ' ').trim();
+        var key = normalizeSku(name);
+        if (!key || seen[key]) return;
+        seen[key] = true;
+        names.push(name);
+      });
+    }
+    if (!names.length) return '';
+    return 'Item not in list: ' + names.join(', ') + ' — ask admin';
+  }
+
+  function missingStageMessage(view) {
+    if (!view || !view.pickComplete) return 'Not picked yet';
+    return 'Not packed yet';
   }
 
   function messageParts(message) {
@@ -609,22 +638,45 @@
   }
 
   function buildWaybillView(waybill, items, scans, config) {
-    var parsed = tryParseCompact(waybill.itemString) || [];
+    var resolved = resolveLineItems(waybill.itemString, waybill.client, [], items);
     var totals = lineTotals(scans, waybill.waybillNo);
-    var lines = parsed.map(function (part) {
-      var item = findItem(items, part.sku, waybill.client);
+    var lines = [];
+    var lineAt = {};
+    (resolved.segments || []).forEach(function (part) {
+      var key = part.unknown ? ('?' + normalizeSku(part.name)) : normalizeSku(part.sku);
+      if (!key) return;
+      if (lineAt[key] != null) {
+        lines[lineAt[key]].expected += part.qty;
+        return;
+      }
+      lineAt[key] = lines.length;
+      if (part.unknown) {
+        lines.push({
+          sku: part.name,
+          name: part.name,
+          barcode: '',
+          unknown: true,
+          expected: part.qty,
+          picked: 0,
+          packed: 0
+        });
+        return;
+      }
       var sku = normalizeSku(part.sku);
-      return {
+      var item = findItem(items, sku, waybill.client);
+      lines.push({
         sku: sku,
-        name: item && !item.ambiguous ? (item.productName || sku) : sku,
+        name: part.name || sku,
         barcode: item && !item.ambiguous ? String(item.barcode || '') : '',
+        unknown: false,
         expected: part.qty,
         picked: totals.picked[sku] || 0,
         packed: totals.packed[sku] || 0
-      };
+      });
     });
-    var pickComplete = lines.length > 0 && lines.every(function (line) { return line.picked >= line.expected; });
-    var packComplete = lines.length > 0 && lines.every(function (line) { return line.packed >= line.expected; });
+    var known = lines.filter(function (line) { return !line.unknown; });
+    var pickComplete = known.length > 0 && lines.every(function (line) { return !line.unknown && line.picked >= line.expected; });
+    var packComplete = known.length > 0 && lines.every(function (line) { return !line.unknown && line.packed >= line.expected; });
     return {
       waybillNo: normWaybill(waybill.waybillNo),
       client: normalizeClient(waybill.client),
@@ -706,12 +758,13 @@
   }
 
   function lineOnView(view, code) {
-    var key = String(code || '').trim().toUpperCase();
+    var key = normalizeSku(code);
     if (!key || !view) return null;
     var lines = view.lines || [];
     for (var i = 0; i < lines.length; i++) {
-      if (lines[i].sku === key) return lines[i];
-      if (lines[i].barcode && String(lines[i].barcode).trim().toUpperCase() === key) return lines[i];
+      if (lines[i].unknown) continue;
+      if (normalizeSku(lines[i].sku) === key) return lines[i];
+      if (lines[i].barcode && normalizeSku(lines[i].barcode) === key) return lines[i];
     }
     return null;
   }
@@ -1010,7 +1063,9 @@
     var actor = samePersonConflict(context.scans, context.staff, waybill, want);
     if (!actor) return null;
     var text = samePersonMessage(actor, want);
-    return errorDecision(null, want, 'SAME_PERSON_STAGE', text, '', 0, text);
+    var blocked = errorDecision(null, want, 'SAME_PERSON_STAGE', text, '', 0, text);
+    blocked.result = 'BLOCKED';
+    return blocked;
   }
 
   function decide(view, event, codes, context) {
@@ -1043,9 +1098,9 @@
       };
     }
 
-    if (String(view.unmapped || '').trim() && action !== 'SHORTAGE') {
-      var unmappedText = 'Unmapped items: ' + String(view.unmapped).trim() + '. Map the J&T name before picking.';
-      return errorDecision(view, stage, 'UNKNOWN_ITEM', unmappedText, '', 0, String(view.unmapped).trim());
+    var unknownText = unknownItemMessage(view);
+    if (unknownText && stage === 'PICK') {
+      return errorDecision(view, stage, 'UNKNOWN_ITEM', unknownText, '', 0, unknownText);
     }
 
     if (view.pickedUp && action !== 'SHORTAGE') {
@@ -1072,7 +1127,7 @@
           view,
           'DISPATCH',
           'DISPATCH_WITHOUT_PACK',
-          MSG.NOT_PACKED_OR_PICKED,
+          missingStageMessage(view),
           '',
           0,
           'Pick complete: ' + (view.pickComplete ? 'yes' : 'no') + ', pack complete: ' + (view.packComplete ? 'yes' : 'no')
@@ -1202,6 +1257,7 @@
           sku: line.sku,
           name: line.name,
           barcode: line.barcode,
+          unknown: !!line.unknown,
           expected: line.expected,
           picked: line.picked,
           packed: line.packed
@@ -1224,12 +1280,14 @@
       return next;
     }
     next.lines.forEach(function (line) {
-      if (line.sku !== decision.sku) return;
+      if (line.unknown) return;
+      if (normalizeSku(line.sku) !== normalizeSku(decision.sku)) return;
       if (decision.stage === 'PACK') line.packed += decision.qty;
       else line.picked += decision.qty;
     });
-    next.pickComplete = next.lines.length > 0 && next.lines.every(function (line) { return line.picked >= line.expected; });
-    next.packComplete = next.lines.length > 0 && next.lines.every(function (line) { return line.packed >= line.expected; });
+    var known = next.lines.filter(function (line) { return !line.unknown; });
+    next.pickComplete = known.length > 0 && next.lines.every(function (line) { return !line.unknown && line.picked >= line.expected; });
+    next.packComplete = known.length > 0 && next.lines.every(function (line) { return !line.unknown && line.packed >= line.expected; });
     if (next.pickComplete) next.pickClosed = true;
     if (next.packComplete) next.packClosed = true;
     return next;
@@ -1366,8 +1424,8 @@
         // Every failed scan gets its own FLAGS row. An older open flag for
         // the same waybill must not swallow the next person's scan.
         var onceWhileOpen = decision.flag === 'PACK_WITHOUT_PICK' || decision.flag === 'DISPATCH_WITHOUT_PACK';
-        if (decision.result === 'ERROR' && !onceWhileOpen) flags.push(flagRow);
-        else pushFlag(flags, model.flags, flagRow, decision.flag === 'STAGE_MISMATCH' ? 'type' : 'open');
+      if ((decision.result === 'ERROR' || decision.result === 'BLOCKED') && !onceWhileOpen) flags.push(flagRow);
+      else pushFlag(flags, model.flags, flagRow, decision.flag === 'STAGE_MISMATCH' ? 'type' : 'open');
       }
 
       if (decision.result === 'OK' && decision.stage === 'PACK') {
@@ -1499,11 +1557,11 @@
       var view = buildWaybillView(waybill, model.items, subset, conf);
       if (view.pickedUp && !view.dispatched) {
         var summaries = (options && options.summaries) || {};
-        var details = summaries[view.waybillNo]
+        var reason = 'J&T picked up but no dispatch scan';
+        var stockNote = summaries[view.waybillNo]
           ? summaries[view.waybillNo]
-          : (fresh[view.waybillNo]
-            ? 'J&T picked this up. Waybill was not in WAYBILLS. No DISPATCH scan.'
-            : 'J&T rider already picked up but there is no DISPATCH scan');
+          : (fresh[view.waybillNo] ? 'Waybill was not in WAYBILLS.' : '');
+        var details = stockNote ? reason + '. ' + stockNote : reason;
         pushFlag(flags, model.flags, makeFlag(
           moment,
           view.waybillNo,
@@ -1626,27 +1684,24 @@
   }
 
   function mapJtNames(parts, client, items) {
-    var mapped = [];
+    var resolved = (parts || []).map(function (part) {
+      return resolveSegment(part.name, part.qty, client, items);
+    });
     var unknown = [];
     var seen = {};
-    (parts || []).forEach(function (part) {
-      var item = findJtItem(items, part.name, client);
-      if (!item) {
-        var key = String(part.name).trim().toLowerCase();
-        if (key && !seen[key]) {
-          seen[key] = true;
-          unknown.push(String(part.name).trim());
-        }
-        return;
-      }
-      mapped.push({
-        sku: normalizeSku(item.sku),
-        qty: part.qty,
-        client: normalizeClient(item.client),
-        name: item.productName || ''
-      });
+    resolved.forEach(function (row) {
+      if (!row.unknown) return;
+      var key = normalizeSku(row.name);
+      if (!key || seen[key]) return;
+      seen[key] = true;
+      unknown.push(row.name);
     });
-    return { items: mergeQty(mapped), unknown: unknown };
+    return {
+      items: mergeQty(resolved.filter(function (row) { return !row.unknown; })),
+      unknown: unknown,
+      segments: resolved,
+      itemString: formatSegments(resolved)
+    };
   }
 
   function waybillHasScan(scans, waybillNo) {
@@ -1706,7 +1761,7 @@
         var created = {
           waybillNo: row.waybillNo,
           client: client,
-          itemString: parsed.items.length ? formatItemString(parsed.items) : '',
+          itemString: parsed.itemString || '',
           rawItems: row.itemName,
           orderDate: asDateOnly(row.submissionTime),
           importedAt: formatManila(moment),
@@ -1754,7 +1809,7 @@
         remap: !!remap
       };
       if (remap) {
-        update.itemString = parsed.items.length ? formatItemString(parsed.items) : (existing.itemString || '');
+        update.itemString = parsed.itemString || existing.itemString || '';
         update.rawItems = row.itemName || existing.rawItems || '';
         update.unmapped = parsed.unknown.join(', ');
       }
@@ -1813,9 +1868,8 @@
         if (inserts[p].waybillNo === waybillNo) pending = inserts[p];
       }
       var existing = pending || findWaybill(model, waybillNo);
-      var itemString = resolved.items.length
-        ? resolved.itemString
-        : (existing && existing.itemString ? existing.itemString : itemText);
+      var itemString = resolved.itemString
+        || (existing && existing.itemString ? existing.itemString : itemText);
 
       var record = {
         waybillNo: waybillNo,
@@ -1825,7 +1879,8 @@
         orderDate: asDateOnly(row.orderDate) || (existing && existing.orderDate) || '',
         importedAt: existing && existing.importedAt ? existing.importedAt : formatManila(moment),
         jtStatus: String(row.jtStatus == null ? '' : row.jtStatus).trim() || (existing && existing.jtStatus) || '',
-        pickupTime: hasPickupTime(row.pickupTime) ? asManilaString(row.pickupTime) : ((existing && existing.pickupTime) || '')
+        pickupTime: hasPickupTime(row.pickupTime) ? asManilaString(row.pickupTime) : ((existing && existing.pickupTime) || ''),
+        unmapped: resolved.unknown.join(', ')
       };
 
       var notInSheet = !findWaybill(model, waybillNo);
@@ -1952,7 +2007,27 @@
     return map;
   }
 
-  function stageOwnerRows(scans) {
+  function countFullyPickedToday(views, scans, isToday) {
+    var last = {};
+    (scans || []).forEach(function (scan) {
+      if (String(scan.stage || '').toUpperCase() !== 'PICK') return;
+      if (String(scan.result || '').toUpperCase() !== 'OK') return;
+      if (String(messageParts(scan.message).body).toUpperCase() === 'SHORTAGE_SUBMIT') return;
+      var no = normWaybill(scan.waybill);
+      var ts = asManilaString(scan.timestamp);
+      if (!last[no] || ts > last[no]) last[no] = ts;
+    });
+    var count = 0;
+    (views || []).forEach(function (view) {
+      if (!view.pickComplete) return;
+      var ts = last[view.waybillNo];
+      if (ts && isToday(ts)) count += 1;
+    });
+    return count;
+  }
+
+  function stageOwnerRows(scans, pickComplete) {
+    var done = pickComplete || null;
     var map = {};
     (scans || []).forEach(function (scan) {
       if (String(scan.result || '').toUpperCase() !== 'OK') return;
@@ -1960,6 +2035,7 @@
       if (stage !== 'PICK' && stage !== 'PACK' && stage !== 'DISPATCH') return;
       var no = normWaybill(scan.waybill);
       if (!no) return;
+      if (stage === 'PICK' && done && !done[no]) return;
       if (!map[no]) map[no] = { waybill: no, PICK: '', PACK: '', DISPATCH: '' };
       var name = scan.staffName || scan.staffEmail || '';
       if (!name) return;
@@ -1983,8 +2059,12 @@
     function isToday(value) {
       return asManilaString(value).slice(0, 10) === today;
     }
+    var summaryViews = (model.waybills || []).map(function (waybill) {
+      return buildWaybillView(waybill, model.items, model.scans, null);
+    });
     var counts = { PICK: 0, PACK: 0, DISPATCH: 0, PICKUP: 0 };
-    ['PICK', 'PACK', 'DISPATCH'].forEach(function (stage) {
+    counts.PICK = countFullyPickedToday(summaryViews, model.scans, isToday);
+    ['PACK', 'DISPATCH'].forEach(function (stage) {
       var set = {};
       (model.scans || []).forEach(function (scan) {
         if (String(scan.stage || '').toUpperCase() !== stage) return;
@@ -2038,7 +2118,8 @@
     }
 
     var counts = { PICK: 0, PACK: 0, DISPATCH: 0, PICKUP: 0 };
-    ['PICK', 'PACK', 'DISPATCH'].forEach(function (stage) {
+    counts.PICK = countFullyPickedToday(views, model.scans, isToday);
+    ['PACK', 'DISPATCH'].forEach(function (stage) {
       var set = {};
       (model.scans || []).forEach(function (scan) {
         if (String(scan.stage || '').toUpperCase() !== stage) return;
@@ -2104,7 +2185,13 @@
       backlog: buckets,
       flags: flags,
       partial: false,
-      stageOwners: stageOwnerRows(model.scans),
+      stageOwners: stageOwnerRows(model.scans, (function () {
+        var done = {};
+        views.forEach(function (view) {
+          if (view.pickComplete) done[view.waybillNo] = true;
+        });
+        return done;
+      })()),
       staffOutput: Object.keys(byStaff).map(function (name) {
         var row = byStaff[name];
         row.name = clipDisplay(row.name);
@@ -2126,8 +2213,19 @@
     return num(beginningQty) + sum;
   }
 
-  function stockFormulasForRow(rowIndex) {
+  function stockFormulasForRow(rowIndex, occurrence) {
     var row = rowIndex;
+    var nth = occurrence || 1;
+    if (nth > 1) {
+      var pick = 'SMALL(INDEX(IF(UPPER(TRIM(ITEMS!A:A))=UPPER(TRIM(A' + row + ')),ROW(ITEMS!A:A)),0),' + nth + ')';
+      return {
+        client: '=IFERROR(INDEX(ITEMS!B:B,' + pick + '),"")',
+        name: '=IFERROR(INDEX(ITEMS!C:C,' + pick + '),"")',
+        beginning: '=IFERROR(INDEX(ITEMS!E:E,' + pick + '),0)',
+        ledger: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ')',
+        onHand: '=D' + row + '+E' + row
+      };
+    }
     return {
       client: '=IFERROR(INDEX(ITEMS!B:B,MATCH(A' + row + ',ITEMS!A:A,0)),"")',
       name: '=IFERROR(INDEX(ITEMS!C:C,MATCH(A' + row + ',ITEMS!A:A,0)),"")',
@@ -2459,34 +2557,55 @@
   function refreshStockFormulas(ss, items) {
     var sheet = ss.getSheetByName(SHEETS.STOCK.name);
     var values = readTableValues(sheet, SHEETS.STOCK.headers.length, 1);
-    var have = {};
+    var rowsBySku = {};
     for (var i = 1; i < values.length; i++) {
-      var sku = normalizeSku(values[i][0]);
-      if (!sku) continue;
-      have[sku] = true;
-      var formulas = stockFormulasForRow(i + 1);
-      sheet.getRange(i + 1, 2, 1, 5).setValues([[
-        formulas.client,
-        formulas.name,
-        formulas.beginning,
-        formulas.ledger,
-        formulas.onHand
-      ]]);
+      var existing = normalizeSku(values[i][0]);
+      if (!existing) continue;
+      if (!rowsBySku[existing]) rowsBySku[existing] = [];
+      rowsBySku[existing].push(i + 1);
     }
+    var needed = {};
+    (items || []).forEach(function (item) {
+      if (!isActiveItem(item)) return;
+      var sku = normalizeSku(item.sku);
+      if (!sku) return;
+      needed[sku] = (needed[sku] || 0) + 1;
+    });
+    var rewritten = 0;
     var start = lastContentRow(sheet, 1) + 1;
     if (start < 2) start = 2;
     var matrix = [];
-    var seen = {};
-    (items || []).forEach(function (item) {
-      var sku = normalizeSku(item.sku);
-      if (!sku || have[sku] || seen[sku]) return;
-      seen[sku] = true;
-      var row = start + matrix.length;
-      var formulas = stockFormulasForRow(row);
-      matrix.push([sku, formulas.client, formulas.name, formulas.beginning, formulas.ledger, formulas.onHand]);
+    Object.keys(needed).forEach(function (sku) {
+      var have = rowsBySku[sku] || [];
+      var n = 0;
+      for (; n < have.length && n < needed[sku]; n++) {
+        var formulas = stockFormulasForRow(have[n], n + 1);
+        sheet.getRange(have[n], 2, 1, 5).setValues([[
+          formulas.client,
+          formulas.name,
+          formulas.beginning,
+          formulas.ledger,
+          formulas.onHand
+        ]]);
+        rewritten += 1;
+      }
+      for (; n < needed[sku]; n++) {
+        var row = start + matrix.length;
+        var added = stockFormulasForRow(row, n + 1);
+        matrix.push([sku, added.client, added.name, added.beginning, added.ledger, added.onHand]);
+      }
     });
     appendMatrix(sheet, matrix);
-    return { formulasRewritten: Object.keys(have).length, added: matrix.length };
+    return { formulasRewritten: rewritten, added: matrix.length, active: Object.keys(needed).reduce(function (sum, sku) { return sum + needed[sku]; }, 0) };
+  }
+
+  function clearSheetBody(sheet, columnCount) {
+    if (!sheet) return 0;
+    var last = sheet.getLastRow();
+    if (last < 2) return 0;
+    var cols = columnCount || 1;
+    sheet.getRange(2, 1, last - 1, cols).clearContent();
+    return last - 1;
   }
 
   function recordsToMatrix(records, fields) {
@@ -2572,21 +2691,39 @@
     return rows;
   }
 
-  function rowsToRecords(values, fields) {
+  function headerColumnIndex(headerRow, headers) {
+    if (!headers || !headers.length) return null;
+    var normalized = (headerRow || []).map(normHeader);
+    var index = [];
+    var found = 0;
+    for (var i = 0; i < headers.length; i++) {
+      var at = normalized.indexOf(normHeader(headers[i]));
+      if (at >= 0) found += 1;
+      index.push(at);
+    }
+    if (!found) return null;
+    return index;
+  }
+
+  function rowsToRecords(values, fields, headers) {
     var out = [];
     if (!values || values.length < 2) return out;
+    var mapped = headerColumnIndex(values[0], headers);
     for (var i = 1; i < values.length; i++) {
       var row = values[i] || [];
+      function cell(fieldIndex) {
+        var at = mapped ? mapped[fieldIndex] : fieldIndex;
+        if (at == null || at < 0) return '';
+        return row[at] == null ? '' : row[at];
+      }
       var blank = true;
       for (var c = 0; c < fields.length; c++) {
-        if (row[c] !== '' && row[c] != null) blank = false;
+        if (cell(c) !== '' && cell(c) != null) blank = false;
       }
       if (blank) continue;
-      if (!cellHasContent(row[0])) continue;
+      if (!cellHasContent(cell(0))) continue;
       var record = { _row: i + 1 };
-      for (var f = 0; f < fields.length; f++) {
-        record[fields[f]] = row[f] == null ? '' : row[f];
-      }
+      for (var f = 0; f < fields.length; f++) record[fields[f]] = cell(f);
       out.push(record);
     }
     return out;
@@ -2662,7 +2799,7 @@
           staffName: String(row.staffName || '').trim(),
           stage: String(row.stage || '').trim().toUpperCase(),
           waybill: normWaybill(row.waybill),
-          sku: row.sku == null ? '' : String(row.sku).trim().toUpperCase(),
+          sku: normalizeSku(row.sku),
           qty: num(row.qty),
           result: String(row.result || '').trim().toUpperCase(),
           message: row.message == null ? '' : String(row.message)
@@ -2790,12 +2927,12 @@
     var junEmail = 'staff@vendes.example';
 
     var items = [
-      { sku: 'WVT-LW', client: 'SIRWEN', productName: 'Women Vest Light Wash', barcode: '4801001000011', beginningQty: 50, active: true },
-      { sku: 'FTB-QUEEN', client: 'SIRWEN', productName: 'Fitted Top Queen', barcode: '', beginningQty: 30, active: true },
-      { sku: 'JOS-TEE', client: 'TREXO', productName: 'Josie Basic Tee', barcode: '4802002000022', beginningQty: 40, active: true },
-      { sku: 'JOS-CAP', client: 'TREXO', productName: 'Josie Cap', barcode: '', beginningQty: 20, active: true },
-      { sku: 'ECM-MUG', client: 'ECOM', productName: 'Ecom Ceramic Mug', barcode: '4803003000033', beginningQty: 100, active: true },
-      { sku: 'ECM-BAG', client: 'ECOM', productName: 'Ecom Tote Bag', barcode: '', beginningQty: 60, active: true },
+      { sku: 'WVT-LW', client: 'SIRWEN', productName: 'Women Vest Light Wash', barcode: '4801001000011', beginningQty: 50, active: true, jtAlias: 'women vest light wash, vest lw' },
+      { sku: 'FTB-QUEEN', client: 'SIRWEN', productName: 'Fitted Top Queen', barcode: '', beginningQty: 30, active: true, jtAlias: 'fitted top queen' },
+      { sku: 'JOS-TEE', client: 'TREXO', productName: 'Josie Basic Tee', barcode: '4802002000022', beginningQty: 40, active: true, jtAlias: 'josie tee, josie basic tee' },
+      { sku: 'JOS-CAP', client: 'TREXO', productName: 'Josie Cap', barcode: '', beginningQty: 20, active: true, jtAlias: 'josie cap' },
+      { sku: 'ECM-MUG', client: 'ECOM', productName: 'Ecom Ceramic Mug', barcode: '4803003000033', beginningQty: 100, active: true, jtAlias: 'ecom mug, ceramic mug' },
+      { sku: 'ECM-BAG', client: 'ECOM', productName: 'Ecom Tote Bag', barcode: '', beginningQty: 60, active: true, jtAlias: 'tote bag, ecom tote' },
       { sku: 'OLD-SKU', client: 'ECOM', productName: 'Discontinued Sample', barcode: '0000000000000', beginningQty: 0, active: false }
     ];
 
@@ -3007,6 +3144,9 @@
     ledgerHasShipOut: ledgerHasShipOut,
     buildAdminDashboard: buildAdminDashboard,
     buildAdminSummary: buildAdminSummary,
+    unknownItemMessage: unknownItemMessage,
+    missingStageMessage: missingStageMessage,
+    clearSheetBody: clearSheetBody,
     onHand: onHand,
     stockFormulasForRow: stockFormulasForRow,
     commitImport: commitImport,

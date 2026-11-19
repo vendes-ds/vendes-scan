@@ -886,8 +886,22 @@
       S.waybillNo = '';
       S.banner = { kind: 'bad', text: block.message };
       beep(false);
-      paint();
+      if (block.flag === 'SAME_PERSON_STAGE') {
+        enqueue({ action: 'OPEN', stage: S.stage, waybill: no, code: no }, false);
+      } else {
+        paint();
+      }
       return;
+    }
+    if (S.stage === 'PICK' && view) {
+      var unknown = L.unknownItemMessage(view);
+      if (unknown) {
+        S.waybillNo = '';
+        S.banner = { kind: 'bad', text: unknown };
+        beep(false);
+        paint();
+        return;
+      }
     }
     var gate = L.decide(view || null, {
       action: S.stage === 'DISPATCH' ? 'DISPATCH' : 'OPEN',
@@ -994,6 +1008,7 @@
     }
     var view = currentView();
     if (!view) return;
+    if (S.stage === 'PICK' && L.unknownItemMessage(view)) return;
     var complete = S.stage === 'PACK' ? view.packComplete : view.pickComplete;
     if (!complete) return;
     S.waybillNo = '';
