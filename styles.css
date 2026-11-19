@@ -36,8 +36,7 @@
     z-index: 5;
   }
   .brand-lock { min-width: 0; }
-  .logo-clip { width: 156px; height: 34px; overflow: hidden; }
-  .logo-clip img { width: 220px; height: auto; display: block; margin: -10px 0 0 -12px; }
+  .brand-logo { display: block; height: 36px; width: auto; max-height: 36px; object-fit: contain; }
   .stage-tag { font-size: 12px; font-weight: 800; letter-spacing: 0.08em; color: var(--red); margin-top: 1px; }
   .back, .back-spacer { width: 64px; }
   .back {
@@ -79,10 +78,10 @@
   }
   .big { min-height: 76px; flex-direction: row; align-items: center; gap: 12px; background: #161616; box-shadow: 0 10px 28px rgba(227, 4, 11, 0.16); }
   .big .mark { width: 40px; height: 40px; border-radius: 12px; background: var(--red); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 800; flex: 0 0 auto; }
-  .big .label { display: flex; flex-direction: column; flex: 1; color: #fff; }
-  .big b, .big .label span { color: #fff; }
-  .big b { font-size: 26px; letter-spacing: 0.04em; }
-  .big .label span { font-size: 14px; opacity: 0.9; }
+  .big .stage-copy { display: flex; flex-direction: column; flex: 1; min-width: 0; background: transparent; color: #fff; border: 0; height: auto; width: auto; margin: 0; padding: 0; }
+  .big .stage-copy b, .big .stage-copy span { color: #fff; background: transparent; }
+  .big .stage-copy b { font-size: 26px; letter-spacing: 0.04em; line-height: 1.1; }
+  .big .stage-copy span { font-size: 14px; opacity: 0.9; }
   .big.dispatch { background: var(--red); box-shadow: none; }
   .big.dispatch .mark { background: #111; }
   .big:active, .wide:active { transform: scale(0.99); }
@@ -170,7 +169,7 @@
   .wide { width: 100%; margin-top: 8px; background: var(--red); border-radius: 999px; }
   .wide.good { background: var(--red); }
   .wide.warn { background: white; color: var(--red); border: 2px solid var(--red); }
-  .wide:disabled { opacity: 0.4; }
+  .wide:disabled { opacity: 0.45; cursor: not-allowed; }
   .cam { background: #111; }
   h2 { font-size: 13px; letter-spacing: 0.06em; font-weight: 800; color: var(--muted); margin: 16px 0 8px; }
   .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }

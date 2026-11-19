@@ -361,7 +361,7 @@
     var label = L.pendingLabel(pendingCount(), S.online, S.syncing);
     var state = S.syncing || pendingCount() ? 'saving' : (S.online ? 'saved' : 'saving');
     return '<header>' + back +
-      '<div class="brand-lock"><div class="logo-clip"><img src="brand/vendes-logo.png" alt="VENDES"></div><div class="stage-tag">' + esc(tag || 'Warehouse') + '</div></div>' +
+      '<div class="brand-lock"><img class="brand-logo" src="brand/vendes-logo.png" alt="VENDES"><div class="stage-tag">' + esc(tag || 'Warehouse') + '</div></div>' +
       '<div id="save-pill" class="save ' + state + '">' + esc(label) + '</div></header>' +
       (S.online ? '' : '<div class="offline-bar">Offline. Scans stay on this phone and sync when you reconnect.</div>');
   }
@@ -385,8 +385,9 @@
 
   function stageButton(goName, stage, text) {
     if (!L.stageAssigned(S.staff, stage)) return '';
+    var badge = stage === 'PACK' ? 'K' : stage.slice(0, 1);
     return '<button type="button" class="big ' + goName + '" data-go="' + goName + '"><span class="mark">' +
-      stage.slice(0, 1) + '</span><span class="label"><b>' + stage + '</b><span>' + text + '</span></span></button>';
+      badge + '</span><span class="stage-copy"><b>' + stage + '</b><span>' + text + '</span></span></button>';
   }
 
   function homeHtml() {
