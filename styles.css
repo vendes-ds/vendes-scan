@@ -12,7 +12,10 @@
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
-  html, body { margin: 0; padding: 0; }
+  html, body { margin: 0; padding: 0; max-width: 100%; }
+  @media screen {
+    html, body, #app { overflow-x: hidden; }
+  }
   body {
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     background: #fff;
@@ -275,7 +278,22 @@
     }
   }
 
-.wb, .flag p, .chips, .pname { overflow-wrap: anywhere; }
+.wb, .flag, .flag b, .flag p, .chips, .pname, .card, .line, .banner span,
+.back-row, .back-row div, .staff-row, .staff-row span, .batch-row, .batch-row div {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+  max-width: 100%;
+}
+.staff-row, .back-row, .flag-top, .batch-row, .line-top, .sku-row, .card, .flag, main, header {
+  min-width: 0;
+  max-width: 100%;
+}
+.staff-row > *, .back-row > *, .flag-top > *, .batch-row > *, .line-top > * {
+  min-width: 0;
+  max-width: 100%;
+}
+.flag button { flex: 0 0 auto; }
   .offline-bar { background: #111; color: white; text-align: center; font-weight: 700; padding: 8px 12px; }
 .install, .signin-card {
   background: white;

@@ -96,6 +96,7 @@
     NO_ITEMS: 'No mapped items',
     ALREADY_SHORT: 'Shortage was already submitted',
     EMPTY: 'Nothing entered',
+    WAYBILL_AS_ITEM: "That's a waybill, scan the item barcode",
     TOO_LONG: 'Too long (max 64 characters)',
     LOADING: 'Still loading',
     STAGE_NOT_ASSIGNED: 'You are not assigned to this stage.',
@@ -661,11 +662,28 @@
     return codes;
   }
 
+  function groupScans(scans) {
+    var byWaybill = {};
+    (scans || []).forEach(function (scan) {
+      var no = normWaybill(scan.waybill);
+      if (!no) return;
+      if (!byWaybill[no]) byWaybill[no] = [];
+      byWaybill[no].push(scan);
+    });
+    return byWaybill;
+  }
+
+  function scansFor(grouped, waybillNo) {
+    if (!grouped) return [];
+    return grouped[normWaybill(waybillNo)] || [];
+  }
+
   function buildStagePayload(model, stage, config, now) {
     var conf = cfg(config);
     var moment = now || new Date();
     var hours = Number(conf.recentPickupHours);
     if (!hours && hours !== 0) hours = 48;
+    var grouped = groupScans(model.scans);
     var waybills = {};
     (model.waybills || []).forEach(function (waybill) {
       var picked = isPickedUp(waybill.jtStatus, waybill.pickupTime, conf);
@@ -675,7 +693,7 @@
         var age = (moment.getTime() - when.getTime()) / 36e5;
         if (age > hours) return;
       }
-      var view = buildWaybillView(waybill, model.items, model.scans, conf);
+      var view = buildWaybillView(waybill, model.items, scansFor(grouped, waybill.waybillNo), conf);
       waybills[view.waybillNo] = view;
     });
     return {
@@ -750,8 +768,30 @@
     return { ok: true, text: text, message: '' };
   }
 
-  function labelBarcodeValue(sku) {
+  function labelBarcodeValue(itemOrSku, barcode) {
+    var sku = '';
+    var code = barcode;
+    if (itemOrSku && typeof itemOrSku === 'object') {
+      sku = itemOrSku.sku;
+      if (code == null) code = itemOrSku.barcode;
+    } else {
+      sku = itemOrSku;
+    }
+    var filled = String(code == null ? '' : code).trim();
+    if (filled) return filled;
     return String(sku == null ? '' : sku).trim();
+  }
+
+  function labelKey(item) {
+    var sku = String(item && item.sku || '').trim();
+    var client = String(item && item.client || '').trim();
+    return sku + '|' + client;
+  }
+
+  function labelCaption(item) {
+    var sku = String(item && item.sku || '').trim();
+    var code = labelBarcodeValue(item);
+    return code + ' SKU: ' + sku;
   }
 
   // Code 128 set B patterns. Index 103–105 are start codes. 106 is stop.
@@ -827,14 +867,17 @@
   function expandLabelCopies(items) {
     var out = [];
     (items || []).forEach(function (item) {
-      var sku = labelBarcodeValue(item && item.sku);
+      var sku = String(item && item.sku || '').trim();
       if (!sku) return;
+      var code = labelBarcodeValue(item);
       var copies = parseInt(item.copies, 10);
       if (!copies || copies < 1) copies = 1;
       if (copies > 200) copies = 200;
       for (var i = 0; i < copies; i++) {
         out.push({
           sku: sku,
+          code: code,
+          barcode: code,
           name: item.name || '',
           clientLabel: item.clientLabel || ''
         });
@@ -856,8 +899,9 @@
       return '<section class="page">' + page.map(function (label) {
         return '<article class="label"><div class="who">' + escHtml(label.clientLabel) + '</div>' +
           '<div class="name">' + escHtml(label.name) + '</div>' +
-          code128Svg(label.sku) +
-          '<div class="sku">' + escHtml(label.sku) + '</div></article>';
+          code128Svg(label.code || label.sku) +
+          '<div class="sku">' + escHtml(label.code || label.sku) + '</div>' +
+          '<div class="sku-line">SKU: ' + escHtml(label.sku) + '</div></article>';
       }).join('') + '</section>';
     }).join('');
     var pageRule = spec.name === 'thermal'
@@ -873,8 +917,9 @@
       '.label{box-sizing:border-box;padding:1mm 1.5mm;font-family:sans-serif;}' +
       '.who{font-size:7pt;font-weight:700;}' +
       '.name{font-size:8pt;font-weight:700;white-space:nowrap;overflow:hidden;}' +
-      '.sku{font-size:9pt;font-weight:800;font-family:monospace;}' +
-      'svg{display:block;width:100%;height:14mm;}' +
+      '.sku{font-size:8pt;font-weight:800;font-family:monospace;line-height:1.1;}' +
+      '.sku-line{font-size:7pt;font-weight:700;font-family:monospace;line-height:1.1;}' +
+      'svg{display:block;width:100%;height:12mm;}' +
       'svg rect{fill:#000;}' +
       '</style></head><body>' + body + '</body></html>';
   }
@@ -937,6 +982,21 @@
     var next = String(nextStage || '').toUpperCase() === 'PICK' ? 'pick'
       : String(nextStage || '').toUpperCase() === 'PACK' ? 'pack' : 'dispatch';
     return 'You already ' + did + ' this waybill (' + (actor.name || actor.email) + '). Someone else must ' + next + ' it.';
+  }
+
+  function looksLikeWaybill(code, context) {
+    var text = normWaybill(code);
+    if (!text) return false;
+    if (/^JT\d+$/.test(text)) return true;
+    var known = context && context.waybillNos;
+    if (!known) return false;
+    if (Array.isArray(known)) {
+      for (var i = 0; i < known.length; i++) {
+        if (normWaybill(known[i]) === text) return true;
+      }
+      return false;
+    }
+    return !!known[text];
   }
 
   function stageGate(context, stage, waybill) {
@@ -1085,6 +1145,9 @@
 
     var line = lineOnView(view, code);
     if (!line) {
+      if (looksLikeWaybill(code, context)) {
+        return errorDecision(view, stage, '', MSG.WAYBILL_AS_ITEM, '', 0, '');
+      }
       var known = codes && codes[String(code).trim().toUpperCase()];
       if (known) {
         return errorDecision(view, stage, 'WRONG_SKU', MSG.WRONG_SKU, known.sku, 0, known.sku + ' @ ' + stage);
@@ -1273,7 +1336,8 @@
       var decision = decide(view, event, buildCodeIndex(model.items), {
         staff: staff,
         scans: model.scans,
-        samePersonStages: samePersonEnabled(ruleSource)
+        samePersonStages: samePersonEnabled(ruleSource),
+        waybillNos: waybillIndex(model.waybills)
       });
       var scan = {
         timestamp: formatManila(moment),
@@ -1413,15 +1477,26 @@
     });
   }
 
+  function waybillIndex(rows) {
+    var set = {};
+    (rows || []).forEach(function (row) {
+      var no = normWaybill(row && row.waybillNo);
+      if (no) set[no] = true;
+    });
+    return set;
+  }
+
   function planAutoFlags(model, config, now, options) {
     var conf = cfg(config);
     var moment = now || new Date();
     var hours = Number(conf.staleDispatchHours);
     if (!hours && hours !== 0) hours = 24;
     var fresh = (options && options.notInWaybills) || {};
+    var grouped = groupScans(model.scans);
     var flags = [];
     (model.waybills || []).forEach(function (waybill) {
-      var view = buildWaybillView(waybill, model.items, model.scans, conf);
+      var subset = scansFor(grouped, waybill.waybillNo);
+      var view = buildWaybillView(waybill, model.items, subset, conf);
       if (view.pickedUp && !view.dispatched) {
         var summaries = (options && options.summaries) || {};
         var details = summaries[view.waybillNo]
@@ -1439,7 +1514,7 @@
         ), 'type');
       }
       if (!view.pickedUp && view.dispatched) {
-        var sent = dispatchInstant(model.scans, view.waybillNo);
+        var sent = dispatchInstant(subset, view.waybillNo);
         if (sent && (moment.getTime() - sent.getTime()) / 36e5 >= hours) {
           pushFlag(flags, model.flags, makeFlag(
             moment,
@@ -1902,12 +1977,59 @@
     });
   }
 
+  function buildAdminSummary(model, now) {
+    var moment = now || new Date();
+    var today = manilaDate(moment);
+    function isToday(value) {
+      return asManilaString(value).slice(0, 10) === today;
+    }
+    var counts = { PICK: 0, PACK: 0, DISPATCH: 0, PICKUP: 0 };
+    ['PICK', 'PACK', 'DISPATCH'].forEach(function (stage) {
+      var set = {};
+      (model.scans || []).forEach(function (scan) {
+        if (String(scan.stage || '').toUpperCase() !== stage) return;
+        if (String(scan.result || '').toUpperCase() !== 'OK') return;
+        if (String(messageParts(scan.message).body).toUpperCase() === 'SHORTAGE_SUBMIT') return;
+        if (!isToday(scan.timestamp)) return;
+        set[normWaybill(scan.waybill)] = true;
+      });
+      counts[stage] = Object.keys(set).length;
+    });
+    var flags = (model.flags || []).filter(function (flag) {
+      return !isResolved(flag);
+    }).map(function (flag) {
+      return {
+        timestamp: clipDisplay(asManilaString(flag.timestamp)),
+        waybill: clipDisplay(normWaybill(flag.waybill)),
+        waybillKey: normWaybill(flag.waybill),
+        _row: flag._row || 0,
+        client: clipDisplay(normalizeClient(flag.client)),
+        clientLabel: clipDisplay(clientLabel(flag.client)),
+        type: clipDisplay(String(flag.type || '').toUpperCase()),
+        details: clipDisplay(flag.details || ''),
+        staff: clipDisplay(flag.staff || '')
+      };
+    }).sort(function (a, b) {
+      return a.timestamp < b.timestamp ? 1 : -1;
+    });
+    return {
+      today: today,
+      counts: counts,
+      flags: flags,
+      backlog: null,
+      stageOwners: null,
+      staffOutput: null,
+      partial: true
+    };
+  }
+
   function buildAdminDashboard(model, now, config) {
     var conf = cfg(config);
     var moment = now || new Date();
     var today = manilaDate(moment);
+    var grouped = groupScans(model.scans);
     var views = (model.waybills || []).map(function (waybill) {
-      return buildWaybillView(waybill, model.items, model.scans, conf);
+      return buildWaybillView(waybill, model.items, scansFor(grouped, waybill.waybillNo), conf);
     });
 
     function isToday(value) {
@@ -1981,6 +2103,7 @@
       counts: counts,
       backlog: buckets,
       flags: flags,
+      partial: false,
       stageOwners: stageOwnerRows(model.scans),
       staffOutput: Object.keys(byStaff).map(function (name) {
         var row = byStaff[name];
@@ -2837,9 +2960,14 @@
     samePersonConflict: samePersonConflict,
     samePersonMessage: samePersonMessage,
     samePersonEnabled: samePersonEnabled,
+    stageGate: stageGate,
+    looksLikeWaybill: looksLikeWaybill,
+    cellHasContent: cellHasContent,
     stageOwnerRows: stageOwnerRows,
     flagItemKey: flagItemKey,
     labelBarcodeValue: labelBarcodeValue,
+    labelKey: labelKey,
+    labelCaption: labelCaption,
     labelPrintMode: labelPrintMode,
     code128Symbols: code128Symbols,
     code128Widths: code128Widths,
@@ -2878,6 +3006,7 @@
     planAutoFlags: planAutoFlags,
     ledgerHasShipOut: ledgerHasShipOut,
     buildAdminDashboard: buildAdminDashboard,
+    buildAdminSummary: buildAdminSummary,
     onHand: onHand,
     stockFormulasForRow: stockFormulasForRow,
     commitImport: commitImport,

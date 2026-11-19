@@ -150,9 +150,18 @@
 
   function decisionContext() {
     var settings = S.model && S.model.settings;
+    var waybillNos = {};
+    ((S.model && S.model.waybills) || []).forEach(function (row) {
+      var no = L.normWaybill(row.waybillNo);
+      if (no) waybillNos[no] = true;
+    });
+    if (S.payload && S.payload.waybills) {
+      Object.keys(S.payload.waybills).forEach(function (no) { waybillNos[no] = true; });
+    }
     return {
       staff: S.staff,
       scans: acceptedScans(),
+      waybillNos: waybillNos,
       samePersonStages: !settings || settings.samePersonStages !== false
     };
   }
@@ -659,11 +668,13 @@
 
   function labelsHtml() {
     var rows = (S.catalog || []).map(function (item) {
-      var qty = S.labelQty[item.sku] || 1;
-      var checked = S.labelOn[item.sku] ? ' checked' : '';
-      return '<div class="sku-row"><label><input type="checkbox" data-sku="' + esc(item.sku) + '"' + checked + '> <b>' +
-        esc(item.sku) + '</b></label><span class="chips">' + esc(item.name) +
-        '</span><input type="number" min="1" max="100" value="' + qty + '" data-qty="' + esc(item.sku) + '"></div>';
+      var key = L.labelKey(item);
+      var qty = S.labelQty[key] || 1;
+      var checked = S.labelOn[key] ? ' checked' : '';
+      return '<div class="sku-row"><label><input type="checkbox" data-key="' + esc(key) + '"' + checked + '> <b>' +
+        esc(item.sku) + '</b></label><span class="chips">' + esc(item.clientLabel) + ' · ' + esc(item.name) +
+        (item.barcode ? ' · ' + esc(item.barcode) : '') +
+        '</span><input type="number" min="1" max="100" value="' + qty + '" data-qty="' + esc(key) + '"></div>';
     }).join('') || '<p class="hint">No SKUs.</p>';
     return headerHtml('Labels') + '<main><div class="modes">' +
       '<button type="button" class="' + (S.labelMode === 'a4' ? 'on' : '') + '" data-action="mode-a4">A4 sheet</button>' +
@@ -703,8 +714,31 @@
     else if (S.screen === 'jt') app.innerHTML = jtHtml();
     else app.innerHTML = stageHtml();
     var input = $('code-input');
-    if (input && !S.scanner) input.focus();
+    armBanner();
+    focusScan();
     wireInstall();
+  }
+
+  function focusScan() {
+    if (S.scanner || (S.screen !== 'stage' && S.screen !== 'pick' && S.screen !== 'pack' && S.screen !== 'dispatch')) return;
+    var input = $('code-input');
+    if (!input || input.disabled) return;
+    try { input.focus({ preventScroll: true }); } catch (err) { input.focus(); }
+  }
+
+  function armBanner() {
+    if (S.bannerHeld === S.banner) return;
+    S.bannerHeld = S.banner;
+    if (S.bannerTimer) clearTimeout(S.bannerTimer);
+    S.bannerTimer = null;
+    if (!S.banner || S.banner.kind !== 'bad') return;
+    var held = S.banner;
+    S.bannerTimer = setTimeout(function () {
+      if (S.banner !== held) return;
+      S.banner = null;
+      S.bannerHeld = null;
+      paint();
+    }, 4000);
   }
 
   function paint() {
@@ -739,6 +773,8 @@
       if (input && !S.scanner) {
         input.placeholder = !S.payload ? L.MSG.LOADING : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode');
       }
+      armBanner();
+      focusScan();
       var done = document.querySelector('[data-action="done"]');
       if (done) {
         var doneOff = S.stage === 'DISPATCH' ? !S.batch.length : !(view && (S.stage === 'PACK' ? view.packComplete : view.pickComplete));
@@ -845,6 +881,14 @@
   function openWaybill(code) {
     var no = L.normWaybill(code);
     var view = S.payload.waybills[no];
+    var block = L.stageGate(decisionContext(), S.stage, no);
+    if (block) {
+      S.waybillNo = '';
+      S.banner = { kind: 'bad', text: block.message };
+      beep(false);
+      paint();
+      return;
+    }
     var gate = L.decide(view || null, {
       action: S.stage === 'DISPATCH' ? 'DISPATCH' : 'OPEN',
       stage: S.stage,
@@ -977,12 +1021,14 @@
   function printLabels() {
     var items = [];
     (S.catalog || []).forEach(function (item) {
-      if (!S.labelOn[item.sku]) return;
+      var key = L.labelKey(item);
+      if (!S.labelOn[key]) return;
       items.push({
         sku: item.sku,
+        barcode: item.barcode,
         name: item.name,
         clientLabel: item.clientLabel,
-        copies: S.labelQty[item.sku] || 1
+        copies: S.labelQty[key] || 1
       });
     });
     if (!items.length) {
@@ -1117,7 +1163,7 @@
   });
 
   document.body.addEventListener('change', function (event) {
-    var sku = event.target.getAttribute && event.target.getAttribute('data-sku');
+    var sku = event.target.getAttribute && (event.target.getAttribute('data-key') || event.target.getAttribute('data-sku'));
     var qty = event.target.getAttribute && event.target.getAttribute('data-qty');
     if (event.target && event.target.id === 'jt-file' && event.target.files && event.target.files[0]) {
       var file = event.target.files[0];
