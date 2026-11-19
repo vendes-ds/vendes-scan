@@ -1,4 +1,4 @@
-var CACHE = 'vendes-scan-v1';
+var CACHE = 'vendes-scan-v2';
 var SHELL = [
   './',
   './index.html',
@@ -10,6 +10,7 @@ var SHELL = [
   './icon-192.png',
   './icon-512.png',
   './apple-touch-icon.png',
+  './brand/vendes-logo.png',
   './vendor/html5-qrcode.min.js'
 ];
 

@@ -1,20 +1,21 @@
 :root {
-    --ink: #142433;
-    --muted: #5c6e7e;
-    --bg: #e7eef3;
-    --navy: #10283d;
-    --line: #d5dee6;
-    --pick: #0f7a45;
-    --pack: #0c5fbf;
-    --dispatch: #c2410c;
-    --bad: #9f1c14;
+    --ink: #111111;
+    --muted: #4f4f4f;
+    --bg: #fff6f6;
+    --navy: #111111;
+    --red: #e3040b;
+    --line: #f0d6d6;
+    --pick: #e3040b;
+    --pack: #111111;
+    --dispatch: #e3040b;
+    --bad: #e3040b;
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
   html, body { margin: 0; padding: 0; }
   body {
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg);
+    background: #fff;
     color: var(--ink);
     font-size: 16px;
     touch-action: manipulation;
@@ -27,21 +28,24 @@
     gap: 8px;
     min-height: 56px;
     padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
-    background: var(--navy);
-    color: white;
+    background: #fff;
+    color: var(--ink);
+    border-bottom: 3px solid var(--red);
     position: sticky;
     top: 0;
     z-index: 5;
   }
-  .brand { font-weight: 800; letter-spacing: 0.14em; font-size: 18px; }
-  .stage-tag { font-size: 13px; opacity: 0.85; margin-top: 1px; }
+  .brand-lock { min-width: 0; }
+  .logo-clip { width: 156px; height: 34px; overflow: hidden; }
+  .logo-clip img { width: 220px; height: auto; display: block; margin: -10px 0 0 -12px; }
+  .stage-tag { font-size: 12px; font-weight: 800; letter-spacing: 0.08em; color: var(--red); margin-top: 1px; }
   .back, .back-spacer { width: 64px; }
   .back {
     height: 36px;
     border: 0;
     border-radius: 8px;
     background: transparent;
-    color: white;
+    color: var(--ink);
     font-weight: 700;
     padding: 0;
     text-align: left;
@@ -52,12 +56,13 @@
     font-weight: 700;
     border-radius: 999px;
     padding: 4px 10px;
-    background: #1d4e89;
+    background: var(--red);
+    color: #fff;
   }
-  .save.saving { background: #a16207; }
-  .save.saved { background: #0f7a45; }
+  .save.saving { background: #111; color: #fff; }
+  .save.saved { background: var(--red); color: #fff; }
   main { padding: 14px 14px 28px; }
-  .hi { font-size: 28px; font-weight: 800; margin: 8px 0 0; }
+  .hi { font-size: 28px; font-weight: 800; margin: 8px 0 0; letter-spacing: -0.03em; color: #111; }
   .sub, .hint, .note { color: var(--muted); margin: 4px 0 14px; }
   .note { font-size: 14px; }
   .big, .wide, .ghost {
@@ -72,12 +77,14 @@
     padding: 14px 16px;
     color: white;
   }
-  .big { min-height: 76px; }
-  .big b { font-size: 28px; letter-spacing: 0.04em; }
-  .big span { font-size: 15px; opacity: 0.92; }
-  .big.pick { background: var(--pick); }
-  .big.pack { background: var(--pack); }
-  .big.dispatch { background: var(--dispatch); }
+  .big { min-height: 76px; flex-direction: row; align-items: center; gap: 12px; background: #161616; box-shadow: 0 10px 28px rgba(227, 4, 11, 0.16); }
+  .big .mark { width: 40px; height: 40px; border-radius: 12px; background: var(--red); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 800; flex: 0 0 auto; }
+  .big .label { display: flex; flex-direction: column; flex: 1; color: #fff; }
+  .big b, .big .label span { color: #fff; }
+  .big b { font-size: 26px; letter-spacing: 0.04em; }
+  .big .label span { font-size: 14px; opacity: 0.9; }
+  .big.dispatch { background: var(--red); box-shadow: none; }
+  .big.dispatch .mark { background: #111; }
   .big:active, .wide:active { transform: scale(0.99); }
   .ghost {
     min-height: 52px;
@@ -154,16 +161,17 @@
     min-height: 52px;
     border: 0;
     border-radius: 12px;
-    background: var(--navy);
+    background: var(--red);
     color: white;
     font-weight: 800;
     padding: 0 14px;
+    border-radius: 999px;
   }
-  .wide { width: 100%; margin-top: 8px; }
-  .wide.good { background: var(--pick); }
-  .wide.warn { background: white; color: var(--bad); border: 2px solid var(--bad); }
+  .wide { width: 100%; margin-top: 8px; background: var(--red); border-radius: 999px; }
+  .wide.good { background: var(--red); }
+  .wide.warn { background: white; color: var(--red); border: 2px solid var(--red); }
   .wide:disabled { opacity: 0.4; }
-  .cam { background: #334e68; }
+  .cam { background: #111; }
   h2 { font-size: 13px; letter-spacing: 0.06em; font-weight: 800; color: var(--muted); margin: 16px 0 8px; }
   .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
   .tile { text-align: center; padding: 8px 2px; }
@@ -269,7 +277,7 @@
   }
 
 .wb, .flag p, .chips, .pname { overflow-wrap: anywhere; }
-.offline-bar { background: #7a4b00; color: white; text-align: center; font-weight: 700; padding: 8px 12px; }
+  .offline-bar { background: #111; color: white; text-align: center; font-weight: 700; padding: 8px 12px; }
 .install, .signin-card {
   background: white;
   border-radius: 14px;

@@ -24,13 +24,13 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  var SHEET_ORDER = ['STAFF', 'ITEMS', 'SKU_MAP', 'WAYBILLS', 'SCANS', 'FLAGS', 'LEDGER', 'STOCK', 'IMPORT'];
+  var SHEET_ORDER = ['STAFF', 'ITEMS', 'SKU_MAP', 'WAYBILLS', 'SCANS', 'FLAGS', 'LEDGER', 'STOCK', 'IMPORT', 'SETTINGS'];
 
   var SHEETS = {
     STAFF: {
       name: 'STAFF',
-      headers: ['Email', 'Name', 'Role', 'Active'],
-      fields: ['email', 'name', 'role', 'active']
+      headers: ['Email', 'Name', 'Role', 'Active', 'Pick', 'Pack', 'Dispatch'],
+      fields: ['email', 'name', 'role', 'active', 'pick', 'pack', 'dispatch']
     },
     ITEMS: {
       name: 'ITEMS',
@@ -71,6 +71,11 @@
       name: 'IMPORT',
       headers: ['Waybill No', 'Item String', 'J&T Status', 'Pickup Time', 'Order Date', 'Client'],
       fields: ['waybillNo', 'itemText', 'jtStatus', 'pickupTime', 'orderDate', 'client']
+    },
+    SETTINGS: {
+      name: 'SETTINGS',
+      headers: ['Setting', 'Value'],
+      fields: ['setting', 'value']
     }
   };
 
@@ -93,6 +98,7 @@
     EMPTY: 'Nothing entered',
     TOO_LONG: 'Too long (max 64 characters)',
     LOADING: 'Still loading',
+    STAGE_NOT_ASSIGNED: 'You are not assigned to this stage.',
     OK: 'OK'
   };
 
@@ -671,7 +677,9 @@
     return {
       stage: String(stage || '').toUpperCase(),
       waybills: waybills,
-      codes: buildCodeIndex(model.items)
+      codes: buildCodeIndex(model.items),
+      actors: stageActorMap(model.scans),
+      samePersonStages: samePersonEnabled(model.settings)
     };
   }
 
@@ -873,7 +881,75 @@
     return String(staff.role || '').trim().toUpperCase() === 'ADMIN';
   }
 
-  function decide(view, event, codes) {
+  function stageFlagSet(staff) {
+    return !!(staff && (isTruthy(staff.pick) || isTruthy(staff.pack) || isTruthy(staff.dispatch)));
+  }
+
+  function stageAssigned(staff, stage) {
+    var want = String(stage || '').toUpperCase();
+    if (!staff) return false;
+    if (staff.active === false) return false;
+    if (String(staff.role || '').toUpperCase() === 'ADMIN') return true;
+    if (!stageFlagSet(staff)) return true;
+    if (want === 'PICK') return isTruthy(staff.pick);
+    if (want === 'PACK') return isTruthy(staff.pack);
+    if (want === 'DISPATCH') return isTruthy(staff.dispatch);
+    return false;
+  }
+
+  function samePersonEnabled(source) {
+    if (!source || source.samePersonStages == null || source.samePersonStages === '') return true;
+    return isTruthy(source.samePersonStages);
+  }
+
+  function samePersonConflict(scans, staff, waybill, stage) {
+    var email = normalizeEmail(staff && staff.email);
+    if (!email) return null;
+    var want = String(stage || '').toUpperCase();
+    var prefer = {
+      DISPATCH: ['PACK', 'PICK'],
+      PACK: ['PICK', 'DISPATCH'],
+      PICK: ['PACK', 'DISPATCH']
+    };
+    var order = prefer[want] || ['PICK', 'PACK', 'DISPATCH'];
+    var found = {};
+    (scans || []).forEach(function (scan) {
+      if (normWaybill(scan.waybill) !== normWaybill(waybill)) return;
+      if (String(scan.result || '').toUpperCase() !== 'OK') return;
+      var done = String(scan.stage || '').toUpperCase();
+      if (done === want) return;
+      if (done !== 'PICK' && done !== 'PACK' && done !== 'DISPATCH') return;
+      if (normalizeEmail(scan.staffEmail) !== email) return;
+      if (!found[done]) found[done] = { stage: done, name: scan.staffName || email, email: email };
+    });
+    for (var i = 0; i < order.length; i++) {
+      if (found[order[i]]) return found[order[i]];
+    }
+    return null;
+  }
+
+  function samePersonMessage(actor, nextStage) {
+    var did = actor.stage === 'PICK' ? 'picked' : actor.stage === 'PACK' ? 'packed' : 'dispatched';
+    var next = String(nextStage || '').toUpperCase() === 'PICK' ? 'pick'
+      : String(nextStage || '').toUpperCase() === 'PACK' ? 'pack' : 'dispatch';
+    return 'You already ' + did + ' this waybill (' + (actor.name || actor.email) + '). Someone else must ' + next + ' it.';
+  }
+
+  function stageGate(context, stage, waybill) {
+    if (!context || !context.staff) return null;
+    var want = String(stage || '').toUpperCase();
+    if (want !== 'PICK' && want !== 'PACK' && want !== 'DISPATCH') return null;
+    if (!stageAssigned(context.staff, want)) {
+      return errorDecision(null, want, 'STAGE_NOT_ASSIGNED', MSG.STAGE_NOT_ASSIGNED, '', 0, MSG.STAGE_NOT_ASSIGNED);
+    }
+    if (!samePersonEnabled(context)) return null;
+    var actor = samePersonConflict(context.scans, context.staff, waybill, want);
+    if (!actor) return null;
+    var text = samePersonMessage(actor, want);
+    return errorDecision(null, want, 'SAME_PERSON_STAGE', text, '', 0, text);
+  }
+
+  function decide(view, event, codes, context) {
     var stage = String((event && event.stage) || '').toUpperCase();
     var action = String((event && event.action) || 'ITEM').toUpperCase();
     var waybillCheck = limitScanText(event && event.waybill);
@@ -883,6 +959,11 @@
     }
     var waybillNo = normWaybill(waybillCheck.text || codeCheck.text);
     var code = codeCheck.text;
+    var gated = stageGate(context, stage, waybillNo);
+    if (gated) {
+      gated.waybill = waybillNo;
+      return gated;
+    }
 
     if (!view) {
       return {
@@ -1177,7 +1258,14 @@
       var waybillNo = normWaybill(event.waybill || event.code);
       var record = findWaybill(model, waybillNo);
       var view = record ? buildWaybillView(record, model.items, model.scans, conf) : null;
-      var decision = decide(view, event, buildCodeIndex(model.items));
+      var ruleSource = (conf && conf.samePersonStages != null && conf.samePersonStages !== '')
+        ? conf
+        : ((model.settings && model.settings.samePersonStages != null) ? model.settings : conf);
+      var decision = decide(view, event, buildCodeIndex(model.items), {
+        staff: staff,
+        scans: model.scans,
+        samePersonStages: samePersonEnabled(ruleSource)
+      });
       var scan = {
         timestamp: formatManila(moment),
         staffEmail: normalizeEmail(staff && staff.email),
@@ -1530,6 +1618,50 @@
     };
   }
 
+  function stageActorMap(scans) {
+    var map = {};
+    (scans || []).forEach(function (scan) {
+      if (String(scan.result || '').toUpperCase() !== 'OK') return;
+      var stage = String(scan.stage || '').toUpperCase();
+      if (stage !== 'PICK' && stage !== 'PACK' && stage !== 'DISPATCH') return;
+      var no = normWaybill(scan.waybill);
+      if (!no) return;
+      if (!map[no]) map[no] = {};
+      if (!map[no][stage]) {
+        map[no][stage] = {
+          name: scan.staffName || scan.staffEmail || '',
+          email: normalizeEmail(scan.staffEmail)
+        };
+      }
+    });
+    return map;
+  }
+
+  function stageOwnerRows(scans) {
+    var map = {};
+    (scans || []).forEach(function (scan) {
+      if (String(scan.result || '').toUpperCase() !== 'OK') return;
+      var stage = String(scan.stage || '').toUpperCase();
+      if (stage !== 'PICK' && stage !== 'PACK' && stage !== 'DISPATCH') return;
+      var no = normWaybill(scan.waybill);
+      if (!no) return;
+      if (!map[no]) map[no] = { waybill: no, PICK: '', PACK: '', DISPATCH: '' };
+      var name = scan.staffName || scan.staffEmail || '';
+      if (!name) return;
+      if (!map[no][stage]) map[no][stage] = name;
+      else if (map[no][stage].indexOf(name) === -1) map[no][stage] += ', ' + name;
+    });
+    return Object.keys(map).sort().map(function (no) {
+      var row = map[no];
+      return {
+        waybill: clipDisplay(row.waybill),
+        PICK: clipDisplay(row.PICK),
+        PACK: clipDisplay(row.PACK),
+        DISPATCH: clipDisplay(row.DISPATCH)
+      };
+    });
+  }
+
   function buildAdminDashboard(model, now, config) {
     var conf = cfg(config);
     var moment = now || new Date();
@@ -1609,6 +1741,7 @@
       counts: counts,
       backlog: buckets,
       flags: flags,
+      stageOwners: stageOwnerRows(model.scans),
       staffOutput: Object.keys(byStaff).map(function (name) {
         var row = byStaff[name];
         row.name = clipDisplay(row.name);
@@ -1981,7 +2114,10 @@
         email: row.email,
         name: row.name,
         role: row.role,
-        active: row.active
+        active: row.active,
+        pick: row.pick,
+        pack: row.pack,
+        dispatch: row.dispatch
       });
     });
     (demoStaff || []).forEach(function (row) {
@@ -1992,7 +2128,10 @@
         email: row.email,
         name: row.name,
         role: row.role,
-        active: row.active
+        active: row.active,
+        pick: row.pick,
+        pack: row.pack,
+        dispatch: row.dispatch
       });
     });
     var me = normalizeEmail(currentEmail);
@@ -2001,7 +2140,10 @@
         email: currentEmail,
         name: 'Admin',
         role: 'ADMIN',
-        active: true
+        active: true,
+        pick: true,
+        pack: true,
+        dispatch: true
       });
     }
     return rows;
@@ -2026,6 +2168,16 @@
     return out;
   }
 
+  function settingsFromRows(rows) {
+    var out = { samePersonStages: true };
+    (rows || []).forEach(function (row) {
+      if (String(row.setting || '').trim().toUpperCase() === 'SAME_PERSON_STAGES') {
+        out.samePersonStages = isTruthy(row.value);
+      }
+    });
+    return out;
+  }
+
   function hydrateModel(raw) {
     raw = raw || {};
     return {
@@ -2035,9 +2187,13 @@
           email: normalizeEmail(row.email),
           name: String(row.name || '').trim(),
           role: String(row.role || '').trim().toUpperCase() === 'ADMIN' ? 'ADMIN' : 'STAFF',
-          active: isTruthy(row.active)
+          active: isTruthy(row.active),
+          pick: row.pick,
+          pack: row.pack,
+          dispatch: row.dispatch
         };
       }),
+      settings: settingsFromRows(raw.settings),
       items: (raw.items || []).map(function (row) {
         return {
           _row: row._row,
@@ -2122,7 +2278,10 @@
           email: want,
           name: String(rows[i].name || '').trim() || want,
           role: role,
-          active: isTruthy(rows[i].active)
+          active: isTruthy(rows[i].active),
+          pick: rows[i].pick,
+          pack: rows[i].pack,
+          dispatch: rows[i].dispatch
         };
       }
     }
@@ -2226,9 +2385,9 @@
     ];
 
     var staff = [
-      { email: mariaEmail, name: maria, role: 'ADMIN', active: true },
-      { email: junEmail, name: jun, role: 'STAFF', active: true },
-      { email: 'old@vendes.example', name: 'Inactive Sample', role: 'STAFF', active: false }
+      { email: mariaEmail, name: maria, role: 'ADMIN', active: true, pick: true, pack: true, dispatch: true },
+      { email: junEmail, name: jun, role: 'STAFF', active: true, pick: true, pack: true, dispatch: false },
+      { email: 'old@vendes.example', name: 'Inactive Sample', role: 'STAFF', active: false, pick: false, pack: false, dispatch: false }
     ];
 
     function wb(no, client, itemString, status, pickupHours, orderHours) {
@@ -2351,7 +2510,8 @@
       scans: scans,
       flags: flags,
       ledger: ledger,
-      importSample: importSample
+      importSample: importSample,
+      settings: { samePersonStages: true }
     };
   }
 
@@ -2368,6 +2528,11 @@
     saveBadge: saveBadge,
     adminCardText: adminCardText,
     stageEntryWhileLoading: stageEntryWhileLoading,
+    stageAssigned: stageAssigned,
+    samePersonConflict: samePersonConflict,
+    samePersonMessage: samePersonMessage,
+    samePersonEnabled: samePersonEnabled,
+    stageOwnerRows: stageOwnerRows,
     flagItemKey: flagItemKey,
     labelBarcodeValue: labelBarcodeValue,
     labelPrintMode: labelPrintMode,

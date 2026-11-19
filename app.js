@@ -126,16 +126,40 @@
       var event = Object.assign({ localId: item.localId }, item.event || {});
       var no = L.normWaybill(event.waybill || event.code);
       var view = S.payload.waybills[no] || null;
-      var decision = L.decide(view, event, S.payload.codes);
+      var decision = L.decide(view, event, S.payload.codes, decisionContext());
       if (decision.result === 'OK' && view) {
         S.payload.waybills[no] = L.applyDecisionToView(view, decision);
       }
     });
   }
 
-  function enqueue(event) {
+  function acceptedScans() {
+    var extra = [];
+    S.queue.forEach(function (item) {
+      if (!item.accepted || !item.event) return;
+      extra.push({
+        waybill: item.event.waybill,
+        stage: item.event.stage,
+        result: 'OK',
+        staffEmail: S.staff && S.staff.email,
+        staffName: S.staff && S.staff.name
+      });
+    });
+    return ((S.model && S.model.scans) || []).concat(extra);
+  }
+
+  function decisionContext() {
+    var settings = S.model && S.model.settings;
+    return {
+      staff: S.staff,
+      scans: acceptedScans(),
+      samePersonStages: !settings || settings.samePersonStages !== false
+    };
+  }
+
+  function enqueue(event, accepted) {
     event.localId = 'L' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-    S.queue.push({ localId: event.localId, event: event, phase: 'new' });
+    S.queue.push({ localId: event.localId, event: event, phase: 'new', accepted: !!accepted });
     saveQueue();
     refreshViews();
     paint();
@@ -179,9 +203,23 @@
         waybills: tables.WAYBILLS,
         scans: tables.SCANS,
         flags: tables.FLAGS,
-        ledger: tables.LEDGER
+        ledger: tables.LEDGER,
+        settings: []
       });
-      saveCache();
+      return api('/values/' + encodeURIComponent('SETTINGS!A:B')).then(function (sheet) {
+        S.model = L.hydrateModel({
+          staff: tables.STAFF,
+          items: tables.ITEMS,
+          skuMap: tables.SKU_MAP,
+          waybills: tables.WAYBILLS,
+          scans: tables.SCANS,
+          flags: tables.FLAGS,
+          ledger: tables.LEDGER,
+          settings: L.rowsToRecords(sheet.values || [], L.SHEETS.SETTINGS.fields)
+        });
+      }).catch(function () {}).then(function () {
+        saveCache();
+      });
     });
   }
 
@@ -323,7 +361,7 @@
     var label = L.pendingLabel(pendingCount(), S.online, S.syncing);
     var state = S.syncing || pendingCount() ? 'saving' : (S.online ? 'saved' : 'saving');
     return '<header>' + back +
-      '<div><div class="brand">VENDES</div><div class="stage-tag">' + esc(tag || 'Warehouse') + '</div></div>' +
+      '<div class="brand-lock"><div class="logo-clip"><img src="brand/vendes-logo.png" alt="VENDES"></div><div class="stage-tag">' + esc(tag || 'Warehouse') + '</div></div>' +
       '<div id="save-pill" class="save ' + state + '">' + esc(label) + '</div></header>' +
       (S.online ? '' : '<div class="offline-bar">Offline. Scans stay on this phone and sync when you reconnect.</div>');
   }
@@ -345,6 +383,12 @@
     return '<section class="install"><b>Add Vendes to the home screen</b><p class="hint">' + esc(text) + '</p>' + button + '</section>';
   }
 
+  function stageButton(goName, stage, text) {
+    if (!L.stageAssigned(S.staff, stage)) return '';
+    return '<button type="button" class="big ' + goName + '" data-go="' + goName + '"><span class="mark">' +
+      stage.slice(0, 1) + '</span><span class="label"><b>' + stage + '</b><span>' + text + '</span></span></button>';
+  }
+
   function homeHtml() {
     var admin = S.staff && L.roleCanUseAdmin(S.staff)
       ? '<button type="button" class="ghost" data-go="admin">Admin</button>'
@@ -353,9 +397,9 @@
       '<p class="hi">Hi, ' + esc(S.staff ? S.staff.name : '') +
       (S.staff && S.staff.role ? ' · ' + esc(S.staff.role) : '') + '</p>' +
       '<p class="sub">Choose a step</p>' +
-      '<button type="button" class="big pick" data-go="pick"><b>PICK</b><span>Collect the items</span></button>' +
-      '<button type="button" class="big pack" data-go="pack"><b>PACK</b><span>Put the items in the parcel</span></button>' +
-      '<button type="button" class="big dispatch" data-go="dispatch"><b>DISPATCH</b><span>Hand the parcel to the rider</span></button>' +
+      stageButton('pick', 'PICK', 'Collect the items') +
+      stageButton('pack', 'PACK', 'Put the items in the parcel') +
+      stageButton('dispatch', 'DISPATCH', 'Hand the parcel to the rider') +
       admin +
       '<p class="note">Scan only. Stock drops when the J&amp;T rider picks the parcel up.</p></main>';
   }
@@ -444,8 +488,18 @@
       '<h2>Today · ' + esc(L.clipDisplay(S.dash.today)) + '</h2><div class="tiles">' + tiles + '</div>' +
       '<h2>Open flags</h2>' + flags +
       '<h2>Backlog</h2>' + backlog +
+      '<h2>Who did each stage</h2>' + ownersHtml() +
       '<p class="note">J&amp;T import still runs from the Google Sheet menu. Stock changes only there.</p>' +
       '<button type="button" class="wide" data-go="labels">Print SKU labels</button></main>';
+  }
+
+  function ownersHtml() {
+    var rows = (S.dash && S.dash.stageOwners) || [];
+    if (!rows.length) return '<p class="hint">No completed stages yet.</p>';
+    return rows.map(function (row) {
+      return '<div class="staff-row"><b class="wb">' + esc(row.waybill) + '</b><span>PICK ' + esc(row.PICK || '—') +
+        ' · PACK ' + esc(row.PACK || '—') + ' · DISPATCH ' + esc(row.DISPATCH || '—') + '</span></div>';
+    }).join('');
   }
 
   function labelsHtml() {
@@ -561,6 +615,14 @@
       render();
       return;
     }
+    if (target === 'pick' || target === 'pack' || target === 'dispatch') {
+      if (!L.stageAssigned(S.staff, target)) {
+        S.banner = { kind: 'bad', text: L.MSG.STAGE_NOT_ASSIGNED };
+        S.screen = 'home';
+        render();
+        return;
+      }
+    }
     if (target === 'admin') {
       if (!L.roleCanUseAdmin(S.staff)) {
         S.screen = 'denied';
@@ -616,6 +678,18 @@
   function openWaybill(code) {
     var no = L.normWaybill(code);
     var view = S.payload.waybills[no];
+    var gate = L.decide(view || null, {
+      action: S.stage === 'DISPATCH' ? 'DISPATCH' : 'OPEN',
+      stage: S.stage,
+      waybill: no,
+      code: no
+    }, S.payload.codes, decisionContext());
+    if (gate.flag === 'SAME_PERSON_STAGE' || gate.flag === 'STAGE_NOT_ASSIGNED') {
+      S.banner = { kind: 'bad', text: gate.message };
+      beep(false);
+      enqueue({ action: 'OPEN', stage: S.stage, waybill: no, code: no }, false);
+      return;
+    }
     if (S.stage === 'DISPATCH') {
       dispatchOne(no, view);
       return;
@@ -650,11 +724,11 @@
       paint();
       return;
     }
-    var decision = L.decide(view || null, { action: 'DISPATCH', stage: 'DISPATCH', waybill: no, code: no }, S.payload.codes);
+    var decision = L.decide(view || null, { action: 'DISPATCH', stage: 'DISPATCH', waybill: no, code: no }, S.payload.codes, decisionContext());
     if (decision.result !== 'OK') {
       S.banner = { kind: 'bad', text: decision.message };
       beep(false);
-      enqueue({ action: 'DISPATCH', stage: 'DISPATCH', waybill: no, code: no });
+      enqueue({ action: 'DISPATCH', stage: 'DISPATCH', waybill: no, code: no }, false);
       return;
     }
     S.batch.push({
@@ -665,13 +739,13 @@
     });
     S.banner = { kind: 'good', text: decision.message };
     beep(true);
-    enqueue({ action: 'DISPATCH', stage: 'DISPATCH', waybill: no, code: '' });
+    enqueue({ action: 'DISPATCH', stage: 'DISPATCH', waybill: no, code: '' }, true);
   }
 
   function scanItem(code) {
     var view = currentView();
     var event = { action: 'ITEM', stage: S.stage, waybill: S.waybillNo, code: code };
-    var decision = L.decide(view, event, S.payload.codes);
+    var decision = L.decide(view, event, S.payload.codes, decisionContext());
     if (decision.result === 'OK') {
       S.banner = { kind: 'good', text: decision.sku + ' added' };
       beep(true);
@@ -679,14 +753,14 @@
       S.banner = { kind: 'bad', text: decision.message };
       beep(false);
     }
-    enqueue(event);
+    enqueue(event, decision.result === 'OK');
   }
 
   function submitShort() {
     var view = currentView();
     if (!view) return;
     var event = { action: 'SHORTAGE', stage: S.stage, waybill: S.waybillNo, code: '' };
-    var decision = L.decide(view, event, S.payload.codes);
+    var decision = L.decide(view, event, S.payload.codes, decisionContext());
     if (decision.result !== 'OK') {
       S.banner = { kind: 'warn', text: decision.message };
       paint();
@@ -695,7 +769,7 @@
     if (!window.confirm('Some pieces are missing. Submit with a shortage and save a flag?')) return;
     S.banner = { kind: 'warn', text: decision.message };
     beep(false);
-    enqueue(event);
+    enqueue(event, true);
   }
 
   function nextStep() {
