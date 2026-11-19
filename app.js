@@ -297,6 +297,7 @@
       S.banner = { kind: 'warn', text: 'Sync paused. Scans stay on this phone.' };
     }).then(function () {
       S.syncing = false;
+      finishCheck();
       paint();
     });
   }
@@ -456,14 +457,14 @@
     }
     var doneLabel = S.stage === 'DISPATCH' ? 'Handover done' : 'Done — next waybill';
     var doneOff = S.stage === 'DISPATCH' ? !S.batch.length : !(viewNow && (S.stage === 'PACK' ? viewNow.packComplete : viewNow.pickComplete));
-    var short = S.stage === 'DISPATCH' || !viewNow ? '' : '<button type="button" class="wide warn" data-action="short">Submit with shortage</button>';
+    var short = L.shortageAllowed(viewNow, S.stage) ? '<button type="button" class="wide warn" id="short-btn" data-action="short">Submit with shortage</button>' : '';
     return headerHtml(S.stage) + '<div id="banner-slot">' + bannerHtml() + '</div><main>' +
       '<div id="live">' + hint + lines + batch + '</div>' +
       '<button type="button" class="wide cam" id="cam-btn" data-action="camera">' + (S.scanner ? 'Close camera' : 'Open camera') + '</button>' +
       '<div id="reader" hidden></div>' +
       '<form id="scan-form"><input id="code-input" maxlength="64" autocomplete="off" autocapitalize="characters" enterkeyhint="go"' +
-      (waiting ? ' disabled' : '') + ' placeholder="' + esc(waiting ? L.MSG.LOADING : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode')) + '">' +
-      '<button type="submit" id="add-btn"' + (waiting ? ' disabled' : '') + '>Add</button></form>' +
+      (waiting || S.checking ? ' disabled' : '') + ' placeholder="' + esc(S.checking ? 'Checking…' : (waiting ? L.MSG.LOADING : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode'))) + '">' +
+      '<button type="submit" id="add-btn"' + (waiting || S.checking ? ' disabled' : '') + '>Add</button></form>' +
       short +
       '<button type="button" class="wide good" data-action="done"' + (doneOff ? ' disabled' : '') + '>' + doneLabel + '</button></main>';
   }
@@ -472,7 +473,9 @@
     if (!S.dash) return headerHtml('Admin') + '<main><p class="hint">Loading dashboard…</p></main>';
     var counts = S.dash.counts || {};
     var tiles = [['PICK', 'Pick'], ['PACK', 'Pack'], ['DISPATCH', 'Dispatch'], ['PICKUP', 'Pickup']].map(function (pair) {
-      return '<div class="tile"><b>' + (counts[pair[0]] || 0) + '</b><span>' + pair[1] + '</span></div>';
+      var short = counts[pair[0] + '_SHORT'] || 0;
+      var extra = short ? '<small>+ ' + short + ' short</small>' : '';
+      return '<div class="tile" title="Waybills that finished ' + pair[1] + ' today"><b>' + (counts[pair[0]] || 0) + '</b><span>' + pair[1] + '</span>' + extra + '</div>';
     }).join('');
     var buckets = [
       ['printedNotPicked', 'Printed, not picked yet'],
@@ -495,7 +498,9 @@
         '<p>' + esc(text.details) + '</p></article>';
     }).join('') || '<p class="hint">No open flags.</p>';
     return headerHtml('Admin') + '<main>' +
-      '<h2>Today · ' + esc(L.clipDisplay(S.dash.today)) + '</h2><div class="tiles">' + tiles + '</div>' +
+      '<h2>Today · ' + esc(L.clipDisplay(S.dash.today)) + '</h2>' +
+      '<p class="hint" title="A count is waybills that finished that stage today. A shortage is shown beside the count, not inside it.">Waybills that finished the stage today. Shortages are counted apart.</p>' +
+      '<div class="tiles">' + tiles + '</div>' +
       '<h2>Open flags</h2>' + flags +
       '<h2>Backlog</h2>' + backlog +
       '<h2>Who did each stage</h2>' + ownersHtml() +
@@ -720,7 +725,7 @@
   }
 
   function focusScan() {
-    if (S.scanner || (S.screen !== 'stage' && S.screen !== 'pick' && S.screen !== 'pack' && S.screen !== 'dispatch')) return;
+    if (S.checking || S.scanner || (S.screen !== 'stage' && S.screen !== 'pick' && S.screen !== 'pack' && S.screen !== 'dispatch')) return;
     var input = $('code-input');
     if (!input || input.disabled) return;
     try { input.focus({ preventScroll: true }); } catch (err) { input.focus(); }
@@ -771,8 +776,13 @@
       if (pill) pill.textContent = L.pendingLabel(pendingCount(), S.online, S.syncing);
       var input = $('code-input');
       if (input && !S.scanner) {
-        input.placeholder = !S.payload ? L.MSG.LOADING : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode');
+        input.disabled = !S.payload || S.checking;
+        input.placeholder = S.checking ? 'Checking…' : (!S.payload ? L.MSG.LOADING : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode'));
       }
+      var add = $('add-btn');
+      if (add) add.disabled = !S.payload || S.checking;
+      var shortBtn = $('short-btn');
+      if (shortBtn) shortBtn.hidden = !L.shortageAllowed(view, S.stage);
       armBanner();
       focusScan();
       var done = document.querySelector('[data-action="done"]');
@@ -856,7 +866,24 @@
     render();
   }
 
+  function rememberedBlock(stage, waybill) {
+    var row = S.recentBlock && S.recentBlock[stage + '|' + waybill];
+    if (!row) return null;
+    if (Date.now() - row.at >= 60000) return null;
+    return row;
+  }
+
+  function finishCheck() {
+    if (!S.checking && !S.checkMessage) return;
+    S.checking = false;
+    if (S.checkMessage) {
+      S.banner = { kind: 'bad', text: S.checkMessage };
+      S.checkMessage = '';
+    }
+  }
+
   function onCode(raw) {
+    if (S.checking) return;
     var code = String(raw || '').trim();
     if (!code) {
       S.banner = { kind: 'bad', text: L.MSG.EMPTY };
@@ -884,11 +911,24 @@
     var block = L.stageGate(decisionContext(), S.stage, no);
     if (block) {
       S.waybillNo = '';
-      S.banner = { kind: 'bad', text: block.message };
       beep(false);
       if (block.flag === 'SAME_PERSON_STAGE') {
+        var again = rememberedBlock(S.stage, no);
+        if (again) {
+          S.banner = { kind: 'bad', text: again.message };
+          paint();
+          return;
+        }
+        S.recentBlock = S.recentBlock || {};
+        S.recentBlock[S.stage + '|' + no] = { at: Date.now(), message: block.message };
+        S.checking = true;
+        S.checkMessage = block.message;
+        S.banner = { kind: 'warn', text: 'Checking…' };
+        paint();
         enqueue({ action: 'OPEN', stage: S.stage, waybill: no, code: no }, false);
+        if (!S.syncing) finishCheck();
       } else {
+        S.banner = { kind: 'bad', text: block.message };
         paint();
       }
       return;

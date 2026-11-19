@@ -1123,6 +1123,17 @@
       // Block unless both stages are fully scanned. pickComplete and
       // packComplete come from OK rows in SCANS, not from the phone's memory.
       if (!view.pickComplete || !view.packComplete) {
+        if (!view.pickComplete && !view.pickClosed) {
+          return errorDecision(
+            view,
+            'DISPATCH',
+            'NOT_PICKED',
+            'Not picked yet. Finish pick before dispatch.',
+            '',
+            0,
+            'No one has picked this waybill'
+          );
+        }
         return errorDecision(
           view,
           'DISPATCH',
@@ -1328,6 +1339,11 @@
         if (isResolved(row)) return false;
         return flagItemKey(row) === flagItemKey(flag);
       }
+      if (mode === 'person') {
+        if (isResolved(row)) return false;
+        if (staffEmailOfFlag(row) !== staffEmailOfFlag(flag)) return false;
+        return samePersonStageOf(row) === samePersonStageOf(flag);
+      }
       if (String(row.details || '') !== String(flag.details || '')) return false;
       if (mode === 'ever') return true;
       return !isResolved(row);
@@ -1397,6 +1413,19 @@
         samePersonStages: samePersonEnabled(ruleSource),
         waybillNos: waybillIndex(model.waybills)
       });
+      if (decision.result === 'BLOCKED' && blockedWithin(model.scans, staff, decision.waybill || waybillNo, decision.stage, moment)) {
+        applied.push({
+          localId: localId,
+          result: 'BLOCKED',
+          message: decision.message,
+          sku: '',
+          stage: decision.stage,
+          waybill: decision.waybill || waybillNo,
+          flag: '',
+          duplicate: true
+        });
+        return;
+      }
       var scan = {
         timestamp: formatManila(moment),
         staffEmail: normalizeEmail(staff && staff.email),
@@ -1423,9 +1452,11 @@
         );
         // Every failed scan gets its own FLAGS row. An older open flag for
         // the same waybill must not swallow the next person's scan.
-        var onceWhileOpen = decision.flag === 'PACK_WITHOUT_PICK' || decision.flag === 'DISPATCH_WITHOUT_PACK';
-      if ((decision.result === 'ERROR' || decision.result === 'BLOCKED') && !onceWhileOpen) flags.push(flagRow);
-      else pushFlag(flags, model.flags, flagRow, decision.flag === 'STAGE_MISMATCH' ? 'type' : 'open');
+        // A same-person block keeps one open flag per waybill, stage, and staff.
+        var onceWhileOpen = decision.flag === 'PACK_WITHOUT_PICK' || decision.flag === 'DISPATCH_WITHOUT_PACK' || decision.flag === 'NOT_PICKED';
+        if (decision.flag === 'SAME_PERSON_STAGE') pushFlag(flags, model.flags, flagRow, 'person');
+        else if ((decision.result === 'ERROR' || decision.result === 'BLOCKED') && !onceWhileOpen) flags.push(flagRow);
+        else pushFlag(flags, model.flags, flagRow, decision.flag === 'STAGE_MISMATCH' ? 'type' : 'open');
       }
 
       if (decision.result === 'OK' && decision.stage === 'PACK') {
@@ -2007,23 +2038,79 @@
     return map;
   }
 
-  function countFullyPickedToday(views, scans, isToday) {
+  function stageIsComplete(view, stage) {
+    if (!view) return false;
+    if (stage === 'PICK') return !!view.pickComplete;
+    if (stage === 'PACK') return !!view.packComplete;
+    if (stage === 'DISPATCH') return !!view.dispatched;
+    return false;
+  }
+
+  function countStageToday(views, scans, stage, isToday) {
+    var name = String(stage || '').toUpperCase();
     var last = {};
+    var short = {};
     (scans || []).forEach(function (scan) {
-      if (String(scan.stage || '').toUpperCase() !== 'PICK') return;
+      if (String(scan.stage || '').toUpperCase() !== name) return;
       if (String(scan.result || '').toUpperCase() !== 'OK') return;
-      if (String(messageParts(scan.message).body).toUpperCase() === 'SHORTAGE_SUBMIT') return;
       var no = normWaybill(scan.waybill);
       var ts = asManilaString(scan.timestamp);
+      if (String(messageParts(scan.message).body).toUpperCase() === 'SHORTAGE_SUBMIT') {
+        if (isToday(ts)) short[no] = true;
+        return;
+      }
       if (!last[no] || ts > last[no]) last[no] = ts;
     });
-    var count = 0;
+    var done = 0;
+    var shortCount = 0;
     (views || []).forEach(function (view) {
-      if (!view.pickComplete) return;
-      var ts = last[view.waybillNo];
-      if (ts && isToday(ts)) count += 1;
+      if (stageIsComplete(view, name)) {
+        var ts = last[view.waybillNo];
+        if (ts && isToday(ts)) done += 1;
+        return;
+      }
+      if (short[view.waybillNo]) shortCount += 1;
     });
-    return count;
+    return { done: done, short: shortCount };
+  }
+
+  function blockedWithin(scans, staff, waybill, stage, now) {
+    var email = normalizeEmail(staff && staff.email);
+    var want = normWaybill(waybill);
+    var stageName = String(stage || '').toUpperCase();
+    var moment = (now || new Date()).getTime();
+    return (scans || []).some(function (scan) {
+      if (String(scan.result || '').toUpperCase() !== 'BLOCKED') return false;
+      if (normalizeEmail(scan.staffEmail) !== email) return false;
+      if (normWaybill(scan.waybill) !== want) return false;
+      if (String(scan.stage || '').toUpperCase() !== stageName) return false;
+      var when = parseManila(scan.timestamp);
+      if (!when) return false;
+      var age = moment - when.getTime();
+      return age >= 0 && age < 60000;
+    });
+  }
+
+  function staffEmailOfFlag(flag) {
+    var text = String(flag && flag.staff || '');
+    var match = text.match(/\(([^)]+)\)\s*$/);
+    return normalizeEmail(match ? match[1] : text);
+  }
+
+  function samePersonStageOf(flag) {
+    var text = String(flag && (flag.details || '') || '');
+    if (/must pack/i.test(text)) return 'PACK';
+    if (/must dispatch/i.test(text)) return 'DISPATCH';
+    if (/must pick/i.test(text)) return 'PICK';
+    return '';
+  }
+
+  function shortageAllowed(view, stage) {
+    var name = String(stage || '').toUpperCase();
+    if (!view || name === 'DISPATCH') return false;
+    if (name === 'PACK') return !view.packComplete;
+    if (name === 'PICK') return !view.pickComplete;
+    return false;
   }
 
   function stageOwnerRows(scans, pickComplete) {
@@ -2062,18 +2149,12 @@
     var summaryViews = (model.waybills || []).map(function (waybill) {
       return buildWaybillView(waybill, model.items, model.scans, null);
     });
-    var counts = { PICK: 0, PACK: 0, DISPATCH: 0, PICKUP: 0 };
-    counts.PICK = countFullyPickedToday(summaryViews, model.scans, isToday);
-    ['PACK', 'DISPATCH'].forEach(function (stage) {
-      var set = {};
-      (model.scans || []).forEach(function (scan) {
-        if (String(scan.stage || '').toUpperCase() !== stage) return;
-        if (String(scan.result || '').toUpperCase() !== 'OK') return;
-        if (String(messageParts(scan.message).body).toUpperCase() === 'SHORTAGE_SUBMIT') return;
-        if (!isToday(scan.timestamp)) return;
-        set[normWaybill(scan.waybill)] = true;
-      });
-      counts[stage] = Object.keys(set).length;
+    var counts = { PICK: 0, PACK: 0, DISPATCH: 0, PICKUP: 0, PICK_SHORT: 0, PACK_SHORT: 0 };
+    ['PICK', 'PACK', 'DISPATCH'].forEach(function (stage) {
+      var tally = countStageToday(summaryViews, model.scans, stage, isToday);
+      counts[stage] = tally.done;
+      if (stage === 'PICK') counts.PICK_SHORT = tally.short;
+      if (stage === 'PACK') counts.PACK_SHORT = tally.short;
     });
     var flags = (model.flags || []).filter(function (flag) {
       return !isResolved(flag);
@@ -2117,18 +2198,12 @@
       return text.slice(0, 10) === today;
     }
 
-    var counts = { PICK: 0, PACK: 0, DISPATCH: 0, PICKUP: 0 };
-    counts.PICK = countFullyPickedToday(views, model.scans, isToday);
-    ['PACK', 'DISPATCH'].forEach(function (stage) {
-      var set = {};
-      (model.scans || []).forEach(function (scan) {
-        if (String(scan.stage || '').toUpperCase() !== stage) return;
-        if (String(scan.result || '').toUpperCase() !== 'OK') return;
-        if (String(messageParts(scan.message).body).toUpperCase() === 'SHORTAGE_SUBMIT') return;
-        if (!isToday(scan.timestamp)) return;
-        set[normWaybill(scan.waybill)] = true;
-      });
-      counts[stage] = Object.keys(set).length;
+    var counts = { PICK: 0, PACK: 0, DISPATCH: 0, PICKUP: 0, PICK_SHORT: 0, PACK_SHORT: 0 };
+    ['PICK', 'PACK', 'DISPATCH'].forEach(function (stage) {
+      var tally = countStageToday(views, model.scans, stage, isToday);
+      counts[stage] = tally.done;
+      if (stage === 'PICK') counts.PICK_SHORT = tally.short;
+      if (stage === 'PACK') counts.PACK_SHORT = tally.short;
     });
     views.forEach(function (view) {
       if (view.pickedUp && isToday(view.pickupTime)) counts.PICKUP += 1;
@@ -3145,6 +3220,9 @@
     buildAdminDashboard: buildAdminDashboard,
     buildAdminSummary: buildAdminSummary,
     unknownItemMessage: unknownItemMessage,
+    shortageAllowed: shortageAllowed,
+    countStageToday: countStageToday,
+    blockedWithin: blockedWithin,
     missingStageMessage: missingStageMessage,
     clearSheetBody: clearSheetBody,
     onHand: onHand,
