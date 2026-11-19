@@ -425,9 +425,8 @@
   }
 
   function stageHtml() {
-    var waiting = !S.payload;
     var hint = '';
-    if (waiting) hint = '<p class="hint">' + esc(L.MSG.LOADING) + '</p>';
+    if (!S.payload) hint = '<p class="hint">' + esc(S.pendingScan ? L.MSG.SCAN_SAVED : L.MSG.LOADING) + '</p>';
     else if (S.stage === 'DISPATCH') hint = '<p class="hint">Scan the waybill. Rider handover. It must be fully packed.</p>';
     else if (!currentView()) hint = '<p class="hint">Scan the waybill. The camera and a Bluetooth scanner both work.</p>';
     else {
@@ -463,8 +462,8 @@
       '<button type="button" class="wide cam" id="cam-btn" data-action="camera">' + (S.scanner ? 'Close camera' : 'Open camera') + '</button>' +
       '<div id="reader" hidden></div>' +
       '<form id="scan-form"><input id="code-input" maxlength="64" autocomplete="off" autocapitalize="characters" enterkeyhint="go"' +
-      (waiting || S.checking ? ' disabled' : '') + ' placeholder="' + esc(S.checking ? 'Checking…' : (waiting ? L.MSG.LOADING : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode'))) + '">' +
-      '<button type="submit" id="add-btn"' + (waiting || S.checking ? ' disabled' : '') + '>Add</button></form>' +
+      (S.checking ? ' disabled' : '') + ' placeholder="' + esc(S.checking ? 'Checking…' : (S.pendingScan ? L.MSG.SCAN_SAVED : (!S.payload ? L.MSG.LOADING : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode')))) + '">' +
+      '<button type="submit" id="add-btn"' + (S.checking ? ' disabled' : '') + '>Add</button></form>' +
       short +
       '<button type="button" class="wide good" data-action="done"' + (doneOff ? ' disabled' : '') + '>' + doneLabel + '</button></main>';
   }
@@ -766,7 +765,7 @@
       var live = $('live');
       var view = currentView();
       var hint = '';
-      if (!S.payload) hint = '<p class="hint">' + esc(L.MSG.LOADING) + '</p>';
+      if (!S.payload) hint = '<p class="hint">' + esc(S.pendingScan ? L.MSG.SCAN_SAVED : L.MSG.LOADING) + '</p>';
       else if (S.stage === 'DISPATCH') hint = '<p class="hint">Scan the waybill. Rider handover. It must be fully packed.</p>';
       else if (!view) hint = '<p class="hint">Scan the waybill. The camera and a Bluetooth scanner both work.</p>';
       else hint = '<div class="card"><div class="wb">' + esc(view.waybillNo) + '</div><span class="pill" data-client="' + esc(view.client) + '">' + esc(view.clientLabel) + '</span></div>';
@@ -789,11 +788,11 @@
       if (pill) pill.textContent = L.pendingLabel(pendingCount(), S.online, S.syncing);
       var input = $('code-input');
       if (input && !S.scanner) {
-        input.disabled = !S.payload || S.checking;
-        input.placeholder = S.checking ? 'Checking…' : (!S.payload ? L.MSG.LOADING : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode'));
+        input.disabled = !!S.checking;
+        input.placeholder = S.checking ? 'Checking…' : (S.pendingScan ? L.MSG.SCAN_SAVED : (!S.payload ? L.MSG.LOADING : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode')));
       }
       var add = $('add-btn');
-      if (add) add.disabled = !S.payload || S.checking;
+      if (add) add.disabled = !!S.checking;
       var shortBtn = $('short-btn');
       if (shortBtn) shortBtn.hidden = !L.shortageAllowed(view, S.stage);
       armBanner();
@@ -876,6 +875,13 @@
     S.waybillNo = '';
     S.batch = [];
     refreshViews();
+    var pending = S.pendingScan || '';
+    if (S.payload && pending) {
+      S.pendingScan = '';
+      render();
+      onCode(pending);
+      return;
+    }
     render();
   }
 
@@ -905,8 +911,14 @@
       return;
     }
     var gate = L.stageEntryWhileLoading(!!S.payload);
+    if (gate.queue) {
+      S.pendingScan = code;
+      setBanner({ kind: 'warn', text: gate.message }, true);
+      paint();
+      return;
+    }
     if (gate.blocked) {
-      S.banner = { kind: 'warn', text: gate.message };
+      setBanner({ kind: 'warn', text: gate.message }, true);
       paint();
       return;
     }
@@ -1223,12 +1235,6 @@
     if (!event.target || event.target.id !== 'scan-form') return;
     event.preventDefault();
     var input = $('code-input');
-    var gate = L.stageEntryWhileLoading(!!S.payload);
-    if (gate.blocked) {
-      S.banner = { kind: 'warn', text: gate.message };
-      paint();
-      return;
-    }
     var value = input.value;
     input.value = '';
     onCode(value);

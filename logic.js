@@ -99,7 +99,8 @@
     EMPTY: 'Nothing entered',
     WAYBILL_AS_ITEM: "That's a waybill, scan the item barcode",
     TOO_LONG: 'Too long (max 64 characters)',
-    LOADING: 'Still loading',
+    LOADING: 'Loading the list…',
+    SCAN_SAVED: 'Loading… scan saved',
     STAGE_NOT_ASSIGNED: 'You are not assigned to this stage.',
     UNMAPPED: 'Unmapped items. Map the J&T name before picking.',
     OK: 'OK'
@@ -1359,6 +1360,11 @@
         if (isResolved(row)) return false;
         return staffEmailOfFlag(row) === staffEmailOfFlag(flag);
       }
+      if (mode === 'code') {
+        if (isResolved(row)) return false;
+        if (staffEmailOfFlag(row) !== staffEmailOfFlag(flag)) return false;
+        return String(row.details || '') === String(flag.details || '');
+      }
       if (String(row.details || '') !== String(flag.details || '')) return false;
       if (mode === 'ever') return true;
       return !isResolved(row);
@@ -1471,6 +1477,7 @@
         var onceWhileOpen = decision.flag === 'PACK_WITHOUT_PICK' || decision.flag === 'DISPATCH_WITHOUT_PACK';
         if (decision.flag === 'SAME_PERSON_STAGE') pushFlag(flags, model.flags, flagRow, 'person');
         else if (decision.flag === 'NOT_PACKED' || decision.flag === 'NOT_PICKED') pushFlag(flags, model.flags, flagRow, 'staff');
+        else if (decision.flag === 'UNKNOWN_CODE') pushFlag(flags, model.flags, flagRow, 'code');
         else if ((decision.result === 'ERROR' || decision.result === 'BLOCKED') && !onceWhileOpen) flags.push(flagRow);
         else pushFlag(flags, model.flags, flagRow, decision.flag === 'STAGE_MISMATCH' ? 'type' : 'open');
       }
@@ -1860,7 +1867,7 @@
         update.rawItems = row.itemName || existing.rawItems || '';
         update.unmapped = parsed.unknown.join(', ');
       }
-      updates.push(update);
+      if (waybillChanged(existing, update)) updates.push(update);
       if (String(update.unmapped || '').trim()) noteUnknown(client, row.waybillNo, String(update.unmapped).split(','));
     });
 
@@ -1935,7 +1942,8 @@
         record.importedAt = pending.importedAt;
         Object.assign(pending, record);
       } else if (existing) {
-        updates.push(copyWaybill(record, existing._row));
+        var nextRow = copyWaybill(record, existing._row);
+        if (waybillChanged(existing, nextRow)) updates.push(nextRow);
       } else {
         inserts.push(record);
         record._notInWaybills = notInSheet;
@@ -2016,6 +2024,18 @@
       flags: flags,
       warnings: warnings
     };
+  }
+
+  function sheetText(value) {
+    return String(value == null ? '' : value).trim();
+  }
+
+  function waybillChanged(existing, next) {
+    var fields = ['client', 'itemString', 'rawItems', 'orderDate', 'jtStatus', 'pickupTime', 'signingTime', 'rtsReason', 'unmapped'];
+    for (var i = 0; i < fields.length; i++) {
+      if (sheetText(existing[fields[i]]) !== sheetText(next[fields[i]])) return true;
+    }
+    return false;
   }
 
   function copyWaybill(record, rowNumber) {
@@ -2958,7 +2978,7 @@
 
   function stageEntryWhileLoading(ready) {
     if (ready) return { blocked: false, message: '', queue: false };
-    return { blocked: true, message: MSG.LOADING, queue: false };
+    return { blocked: false, message: MSG.SCAN_SAVED, queue: true };
   }
 
   function adminCardText(flag) {
