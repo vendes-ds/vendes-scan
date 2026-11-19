@@ -86,7 +86,6 @@
     SKIP_PACK: 'Stage skipped — finish PICK first',
     SKIP_DISPATCH: 'Stage skipped — pack before dispatch',
     NOT_PICKED: 'Not picked yet',
-    NOT_PACKED_OR_PICKED: 'Not packed yet / not picked yet',
     NOT_PACKED: 'Not packed yet',
     ITEM_NOT_IN_LIST: 'Item not in list: ',
     UNKNOWN_WB: 'Unknown waybill — not on the list',
@@ -486,15 +485,43 @@
    * Order: exact SKU, exact J&T Alias, exact Product Name. Same client only.
    * A shorter word inside the name is not a match.
    */
+  function itemLookup(items) {
+    if (items && items.bySku) return items;
+    var bySku = {};
+    var byAlias = {};
+    var byName = {};
+    var list = [];
+    (items || []).forEach(function (item) {
+      if (!isActiveItem(item)) return;
+      list.push(item);
+      var client = normalizeClient(item.client);
+      function put(map, key) {
+        if (!key) return;
+        var scoped = client + '|' + key;
+        var any = '*|' + key;
+        if (!map[scoped]) map[scoped] = [];
+        map[scoped].push(item);
+        if (!map[any]) map[any] = [];
+        map[any].push(item);
+      }
+      put(bySku, normalizeSku(item.sku));
+      aliasList(item.jtAlias).forEach(function (alias) { put(byAlias, normalizeSku(alias)); });
+      put(byName, normalizeSku(item.productName));
+    });
+    return { bySku: bySku, byAlias: byAlias, byName: byName, list: list };
+  }
+
+  function lookupRows(map, hint, label) {
+    if (!map || !label) return [];
+    if (hint) return map[hint + '|' + label] || [];
+    return map['*|' + label] || [];
+  }
+
   function resolveSegment(name, qty, client, items) {
     var label = normalizeSku(name);
     var hint = normalizeClient(client);
     if (!label) return unknownSegment(name, qty);
-    var pool = (items || []).filter(function (item) {
-      if (!isActiveItem(item)) return false;
-      if (hint && normalizeClient(item.client) !== hint) return false;
-      return true;
-    });
+    var lookup = itemLookup(items);
     function hit(row) {
       return {
         sku: normalizeSku(row.sku),
@@ -504,17 +531,14 @@
         unknown: false
       };
     }
-    var bySku = pool.filter(function (item) { return normalizeSku(item.sku) === label; });
-    if (bySku.length === 1) return hit(bySku[0]);
-    var byAlias = pool.filter(function (item) {
-      return aliasList(item.jtAlias).some(function (alias) { return normalizeSku(alias) === label; });
-    });
-    if (byAlias.length === 1) return hit(byAlias[0]);
-    var byName = pool.filter(function (item) {
-      return normalizeSku(item.productName) === label;
-    });
-    if (byName.length === 1) return hit(byName[0]);
-    return unknownSegment(name, qty);
+    function one(rows) {
+      if (!rows || rows.length !== 1) return null;
+      return hit(rows[0]);
+    }
+    return one(lookupRows(lookup.bySku, hint, label))
+      || one(lookupRows(lookup.byAlias, hint, label))
+      || one(lookupRows(lookup.byName, hint, label))
+      || unknownSegment(name, qty);
   }
 
   function resolveLineItems(rawText, clientHint, skuMap, items) {
@@ -639,6 +663,7 @@
   }
 
   function buildWaybillView(waybill, items, scans, config) {
+    var catalog = items && items.list ? items.list : items;
     var resolved = resolveLineItems(waybill.itemString, waybill.client, [], items);
     var totals = lineTotals(scans, waybill.waybillNo);
     var lines = [];
@@ -664,7 +689,7 @@
         return;
       }
       var sku = normalizeSku(part.sku);
-      var item = findItem(items, sku, waybill.client);
+      var item = findItem(catalog, sku, waybill.client);
       lines.push({
         sku: sku,
         name: part.name || sku,
@@ -737,6 +762,7 @@
     var hours = Number(conf.recentPickupHours);
     if (!hours && hours !== 0) hours = 48;
     var grouped = groupScans(model.scans);
+    var lookup = itemLookup(model.items);
     var waybills = {};
     (model.waybills || []).forEach(function (waybill) {
       var picked = isPickedUp(waybill.jtStatus, waybill.pickupTime, conf);
@@ -746,13 +772,13 @@
         var age = (moment.getTime() - when.getTime()) / 36e5;
         if (age > hours) return;
       }
-      var view = buildWaybillView(waybill, model.items, scansFor(grouped, waybill.waybillNo), conf);
+      var view = buildWaybillView(waybill, lookup, scansFor(grouped, waybill.waybillNo), conf);
       waybills[view.waybillNo] = view;
     });
     return {
       stage: String(stage || '').toUpperCase(),
       waybills: waybills,
-      codes: buildCodeIndex(model.items),
+      codes: buildCodeIndex(lookup.list),
       actors: stageActorMap(model.scans),
       samePersonStages: samePersonEnabled(model.settings)
     };
@@ -1124,7 +1150,7 @@
       // Block unless both stages are fully scanned. pickComplete and
       // packComplete come from OK rows in SCANS, not from the phone's memory.
       if (!view.pickComplete || !view.packComplete) {
-        if (!view.pickComplete && !view.pickClosed) {
+        if (!view.pickComplete) {
           return errorDecision(
             view,
             'DISPATCH',
@@ -1132,28 +1158,17 @@
             'Not picked yet. Finish pick before dispatch.',
             '',
             0,
-            'No one has picked this waybill'
-          );
-        }
-        if (view.pickComplete && !view.packComplete) {
-          return errorDecision(
-            view,
-            'DISPATCH',
-            'NOT_PACKED',
-            'Not packed yet',
-            '',
-            0,
-            'Picked, not packed yet'
+            'Pick is not finished'
           );
         }
         return errorDecision(
           view,
           'DISPATCH',
-          'DISPATCH_WITHOUT_PACK',
-          missingStageMessage(view),
+          'NOT_PACKED',
+          'Not packed yet',
           '',
           0,
-          'Pick complete: ' + (view.pickComplete ? 'yes' : 'no') + ', pack complete: ' + (view.packComplete ? 'yes' : 'no')
+          'Picked, not packed yet'
         );
       }
       var mismatch = mismatchText(view);

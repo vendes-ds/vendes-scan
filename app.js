@@ -462,7 +462,7 @@
       '<button type="button" class="wide cam" id="cam-btn" data-action="camera">' + (S.scanner ? 'Close camera' : 'Open camera') + '</button>' +
       '<div id="reader" hidden></div>' +
       '<form id="scan-form"><input id="code-input" maxlength="64" autocomplete="off" autocapitalize="characters" enterkeyhint="go"' +
-      (S.checking ? ' disabled' : '') + ' placeholder="' + esc(S.checking ? 'Checking…' : (S.pendingScan ? L.MSG.SCAN_SAVED : (!S.payload ? L.MSG.LOADING : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode')))) + '">' +
+      ' placeholder="' + esc(S.checking ? 'Checking…' : (S.pendingScan ? L.MSG.SCAN_SAVED : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode'))) + '">' +
       '<button type="submit" id="add-btn"' + (S.checking ? ' disabled' : '') + '>Add</button></form>' +
       short +
       '<button type="button" class="wide good" data-action="done"' + (doneOff ? ' disabled' : '') + '>' + doneLabel + '</button></main>';
@@ -788,8 +788,9 @@
       if (pill) pill.textContent = L.pendingLabel(pendingCount(), S.online, S.syncing);
       var input = $('code-input');
       if (input && !S.scanner) {
-        input.disabled = !!S.checking;
-        input.placeholder = S.checking ? 'Checking…' : (S.pendingScan ? L.MSG.SCAN_SAVED : (!S.payload ? L.MSG.LOADING : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode')));
+        input.disabled = false;
+        input.readOnly = !!S.checking;
+        input.placeholder = S.checking ? 'Checking…' : (S.pendingScan ? L.MSG.SCAN_SAVED : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode'));
       }
       var add = $('add-btn');
       if (add) add.disabled = !!S.checking;
@@ -1229,6 +1230,29 @@
       S.labelMode = el.getAttribute('data-action') === 'mode-a4' ? 'a4' : 'thermal';
       render();
     } else if (el.hasAttribute('data-resolve')) resolveFlag(el);
+  });
+
+  document.body.addEventListener('keydown', function (event) {
+    if (S.screen !== 'stage' || S.checking) return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    var input = $('code-input');
+    if (event.key === 'Enter') {
+      if (event.target && event.target.id === 'code-input') return;
+      event.preventDefault();
+      var code = ((input && input.value) || S.draft || '').trim();
+      if (input) input.value = '';
+      S.draft = '';
+      onCode(code);
+      return;
+    }
+    if (!event.key || event.key.length !== 1) return;
+    if (event.target && event.target.id === 'code-input') return;
+    S.draft = (S.draft || '') + event.key;
+    if (input) {
+      input.disabled = false;
+      input.value = (input.value || '') + event.key;
+      try { input.focus({ preventScroll: true }); } catch (err) { input.focus(); }
+    }
   });
 
   document.body.addEventListener('submit', function (event) {
