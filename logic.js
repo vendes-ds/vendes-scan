@@ -2024,8 +2024,8 @@
   }
 
   /**
-   * Checkbox validation can leave the word FALSE in rows that have no person.
-   * Those offsets (0-based in the body) should be cleared. Real staff rows stay.
+   * Checkbox validation can leave the word FALSE under the real rows.
+   * Clear those offsets when the key cell (Email, SKU, or timestamp) is empty.
    */
   function falseOnlySpans(keys, values) {
     var spans = [];
@@ -2506,7 +2506,7 @@
           active: isTruthy(row.active),
           jtAlias: String(row.jtAlias || '').trim()
         };
-      }),
+      }).filter(function (row) { return row.sku; }),
       skuMap: (raw.skuMap || []).map(function (row) {
         return {
           _row: row._row,
