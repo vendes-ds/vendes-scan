@@ -294,7 +294,7 @@
       refreshViews();
       if (S.screen === 'admin') S.dash = L.buildAdminDashboard(S.model, new Date(), null);
     }).catch(function () {
-      S.banner = { kind: 'warn', text: 'Sync paused. Scans stay on this phone.' };
+      setBanner({ kind: 'warn', text: 'Sync paused. Scans stay on this phone.' }, false);
     }).then(function () {
       S.syncing = false;
       finishCheck();
@@ -731,17 +731,30 @@
     try { input.focus({ preventScroll: true }); } catch (err) { input.focus(); }
   }
 
+  function setBanner(next, force) {
+    var decision = L.nextBanner(S.banner, next || null, Date.now(), S.bannerHold || 0, !!force);
+    S.banner = decision.banner;
+    S.bannerHold = decision.holdUntil || 0;
+    if (!decision.kept) S.bannerHeld = null;
+  }
+
   function armBanner() {
+    if (S.banner && (S.banner.kind === 'bad' || S.banner.kind === 'warn') && S.bannerStamp !== S.banner) {
+      S.bannerStamp = S.banner;
+      S.bannerHold = Date.now() + 4000;
+    }
     if (S.bannerHeld === S.banner) return;
     S.bannerHeld = S.banner;
     if (S.bannerTimer) clearTimeout(S.bannerTimer);
     S.bannerTimer = null;
-    if (!S.banner || S.banner.kind !== 'bad') return;
+    if (!S.banner || (S.banner.kind !== 'bad' && S.banner.kind !== 'warn')) return;
     var held = S.banner;
     S.bannerTimer = setTimeout(function () {
       if (S.banner !== held) return;
+      if (S.bannerHold && Date.now() < S.bannerHold) return;
       S.banner = null;
       S.bannerHeld = null;
+      S.bannerHold = 0;
       paint();
     }, 4000);
   }
@@ -877,7 +890,7 @@
     if (!S.checking && !S.checkMessage) return;
     S.checking = false;
     if (S.checkMessage) {
-      S.banner = { kind: 'bad', text: S.checkMessage };
+      setBanner({ kind: 'bad', text: S.checkMessage }, true);
       S.checkMessage = '';
     }
   }
@@ -886,7 +899,8 @@
     if (S.checking) return;
     var code = String(raw || '').trim();
     if (!code) {
-      S.banner = { kind: 'bad', text: L.MSG.EMPTY };
+      if (S.bannerHold && Date.now() < S.bannerHold) return;
+      setBanner({ kind: 'bad', text: L.MSG.EMPTY }, true);
       paint();
       return;
     }
@@ -1032,9 +1046,12 @@
       return;
     }
     if (!window.confirm('Some pieces are missing. Submit with a shortage and save a flag?')) return;
-    S.banner = { kind: 'warn', text: decision.message };
+    S.waybillNo = '';
+    setBanner({ kind: 'good', text: decision.message }, true);
     beep(false);
     enqueue(event, true);
+    refreshViews();
+    paint();
   }
 
   function nextStep() {

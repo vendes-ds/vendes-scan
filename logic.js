@@ -1134,6 +1134,17 @@
             'No one has picked this waybill'
           );
         }
+        if (view.pickComplete && !view.packComplete) {
+          return errorDecision(
+            view,
+            'DISPATCH',
+            'NOT_PACKED',
+            'Not packed yet',
+            '',
+            0,
+            'Picked, not packed yet'
+          );
+        }
         return errorDecision(
           view,
           'DISPATCH',
@@ -1344,6 +1355,10 @@
         if (staffEmailOfFlag(row) !== staffEmailOfFlag(flag)) return false;
         return samePersonStageOf(row) === samePersonStageOf(flag);
       }
+      if (mode === 'staff') {
+        if (isResolved(row)) return false;
+        return staffEmailOfFlag(row) === staffEmailOfFlag(flag);
+      }
       if (String(row.details || '') !== String(flag.details || '')) return false;
       if (mode === 'ever') return true;
       return !isResolved(row);
@@ -1453,8 +1468,9 @@
         // Every failed scan gets its own FLAGS row. An older open flag for
         // the same waybill must not swallow the next person's scan.
         // A same-person block keeps one open flag per waybill, stage, and staff.
-        var onceWhileOpen = decision.flag === 'PACK_WITHOUT_PICK' || decision.flag === 'DISPATCH_WITHOUT_PACK' || decision.flag === 'NOT_PICKED';
+        var onceWhileOpen = decision.flag === 'PACK_WITHOUT_PICK' || decision.flag === 'DISPATCH_WITHOUT_PACK';
         if (decision.flag === 'SAME_PERSON_STAGE') pushFlag(flags, model.flags, flagRow, 'person');
+        else if (decision.flag === 'NOT_PACKED' || decision.flag === 'NOT_PICKED') pushFlag(flags, model.flags, flagRow, 'staff');
         else if ((decision.result === 'ERROR' || decision.result === 'BLOCKED') && !onceWhileOpen) flags.push(flagRow);
         else pushFlag(flags, model.flags, flagRow, decision.flag === 'STAGE_MISMATCH' ? 'type' : 'open');
       }
@@ -2103,6 +2119,18 @@
     if (/must dispatch/i.test(text)) return 'DISPATCH';
     if (/must pick/i.test(text)) return 'PICK';
     return '';
+  }
+
+  function nextBanner(current, next, now, holdUntil, force) {
+    var kind = current && current.kind;
+    var held = kind === 'bad' || kind === 'warn';
+    if (!force && held && holdUntil && now < holdUntil) {
+      return { banner: current, holdUntil: holdUntil, kept: true };
+    }
+    var banner = next || null;
+    var hold = 0;
+    if (banner && (banner.kind === 'bad' || banner.kind === 'warn')) hold = now + 4000;
+    return { banner: banner, holdUntil: hold, kept: false };
   }
 
   function shortageAllowed(view, stage) {
@@ -3221,6 +3249,7 @@
     buildAdminSummary: buildAdminSummary,
     unknownItemMessage: unknownItemMessage,
     shortageAllowed: shortageAllowed,
+    nextBanner: nextBanner,
     countStageToday: countStageToday,
     blockedWithin: blockedWithin,
     missingStageMessage: missingStageMessage,
