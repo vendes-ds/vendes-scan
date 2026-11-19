@@ -11,7 +11,8 @@ var SHELL = [
   './icon-512.png',
   './apple-touch-icon.png',
   './brand/vendes-logo.png',
-  './vendor/html5-qrcode.min.js'
+  './vendor/html5-qrcode.min.js',
+  './vendor/xlsx.mini.min.js'
 ];
 
 self.addEventListener('install', function (event) {

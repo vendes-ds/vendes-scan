@@ -491,6 +491,7 @@
       '<h2>Backlog</h2>' + backlog +
       '<h2>Who did each stage</h2>' + ownersHtml() +
       '<p class="note">J&amp;T import still runs from the Google Sheet menu. Stock changes only there.</p>' +
+      '<button type="button" class="wide" data-go="jt">Import J&T export</button>' +
       '<button type="button" class="wide" data-go="labels">Print SKU labels</button></main>';
   }
 
@@ -501,6 +502,159 @@
       return '<div class="staff-row"><b class="wb">' + esc(row.waybill) + '</b><span>PICK ' + esc(row.PICK || '—') +
         ' · PACK ' + esc(row.PACK || '—') + ' · DISPATCH ' + esc(row.DISPATCH || '—') + '</span></div>';
     }).join('');
+  }
+
+  function jtHtml() {
+    var preview = S.jtPreview;
+    var body = '';
+    if (preview) {
+      var clients = preview.byClient || {};
+      var unknown = (preview.unknownItems || []).slice(0, 12).map(function (row) {
+        return '<li>' + esc(row.client) + ' · ' + esc(row.name) + ' · ' + row.count + '</li>';
+      }).join('') || '<li>None</li>';
+      body = '<div class="card"><b>Preview</b>' +
+        '<p>ECOM ' + (clients.ECOM || 0) + ' · SIRWEN ' + (clients.SIRWEN || 0) + ' · TREXO ' + (clients.TREXO || 0) + '</p>' +
+        '<p>New waybills: ' + preview.newWaybills + '</p>' +
+        '<p>Status updates: ' + preview.updated + '</p>' +
+        '<p>Dropped rows: ' + preview.dropped + '</p>' +
+        '<p>Unknown item names</p><ul>' + unknown + '</ul>' +
+        '<p class="hint">Stock is not changed. Only status is updated on waybills that are already in the sheet.</p>' +
+        '<button type="button" class="wide good" data-action="jt-write">Write to the sheet</button></div>';
+    }
+    var note = S.jtMessage ? '<p class="banner warn">' + esc(S.jtMessage) + '</p>' : '';
+    return headerHtml('Import') + '<main>' + note +
+      '<p class="hint">Choose the J&T My Waybill xlsx. Other creator codes are dropped. Personal columns are not stored.</p>' +
+      '<input id="jt-file" type="file" accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">' +
+      '<p id="jt-status" class="hint">' + (S.jtBusy ? 'Reading the file…' : '') + '</p>' +
+      body + '</main>';
+  }
+
+  function loadXlsx() {
+    return new Promise(function (resolve, reject) {
+      if (window.XLSX) return resolve();
+      var script = document.createElement('script');
+      script.src = 'vendor/xlsx.mini.min.js';
+      script.onload = function () { resolve(); };
+      script.onerror = function () { reject(new Error('xlsx')); };
+      document.head.appendChild(script);
+    });
+  }
+
+  function readJtFile(file) {
+    S.jtBusy = true;
+    S.jtMessage = 'Reading the file…';
+    render();
+    var reader = new FileReader();
+    reader.onload = function () {
+      setTimeout(function () {
+        try {
+          var wb = XLSX.read(new Uint8Array(reader.result), { type: 'array' });
+          var name = wb.SheetNames.indexOf('Sheet0') >= 0 ? 'Sheet0' : wb.SheetNames[0];
+          var rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { defval: '', raw: false });
+          var kept = [];
+          var index = 0;
+          function step() {
+            var end = Math.min(index + 4000, rows.length);
+            for (; index < end; index++) {
+              var view = L.jtExportView(rows[index]);
+              if (!view.waybillNo && !view.creatorCode) continue;
+              kept.push({
+                'Creator Code': view.creatorCode,
+                'Waybill Number': view.waybillNo,
+                'Order Status': view.orderStatus,
+                'SigningTime': view.signingTime,
+                'Submission Time': view.submissionTime,
+                'RTS Reason': view.rtsReason,
+                'Item Name': view.itemName
+              });
+            }
+            if (index < rows.length) {
+              S.jtMessage = 'Filtering ' + index + ' / ' + rows.length;
+              var status = $('jt-status');
+              if (status) status.textContent = S.jtMessage;
+              setTimeout(step, 0);
+              return;
+            }
+            S.jtPlan = L.planJtExport(kept, S.model, new Date());
+            S.jtPreview = S.jtPlan.preview;
+            S.jtBusy = false;
+            S.jtMessage = '';
+            render();
+          }
+          step();
+        } catch (err) {
+          S.jtBusy = false;
+          S.jtMessage = 'Could not read that file.';
+          render();
+        }
+      }, 30);
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function writeJtPlan() {
+    var plan = S.jtPlan;
+    if (!plan || S.demo) {
+      S.jtMessage = S.demo ? 'Demo preview only. Nothing was written.' : 'Choose a file first.';
+      render();
+      return;
+    }
+    if (!S.token || !S.online) {
+      S.jtMessage = 'Sign in and stay online to write the sheet.';
+      render();
+      return;
+    }
+    S.jtBusy = true;
+    S.jtMessage = 'Writing…';
+    render();
+    var inserts = plan.inserts || [];
+    var chain = appendRows('WAYBILLS', inserts.map(function (row) {
+      return {
+        waybillNo: row.waybillNo,
+        client: row.client,
+        itemString: row.itemString,
+        orderDate: row.orderDate,
+        importedAt: row.importedAt,
+        jtStatus: row.jtStatus,
+        pickupTime: '',
+        rawItems: row.rawItems,
+        signingTime: row.signingTime,
+        rtsReason: row.rtsReason,
+        unmapped: row.unmapped
+      };
+    }));
+    (plan.updates || []).forEach(function (update) {
+      if (!update._row) return;
+      var fields = L.SHEETS.WAYBILLS.fields;
+      function put(field) {
+        var col = fields.indexOf(field) + 1;
+        if (col < 1) return;
+        chain = chain.then(function () {
+          return writeValues('WAYBILLS!' + L.columnName(col) + update._row, [[update[field] || '']]);
+        });
+      }
+      put('jtStatus');
+      put('signingTime');
+      put('rtsReason');
+      if (update.remap) {
+        put('itemString');
+        put('rawItems');
+        put('unmapped');
+      }
+    });
+    chain = chain.then(function () { return appendRows('FLAGS', plan.flags || []); });
+    chain.then(function () {
+      S.jtBusy = false;
+      S.jtMessage = 'Wrote ' + inserts.length + ' new waybills and ' + (plan.updates || []).length + ' status updates.';
+      S.jtPlan = null;
+      return loadSheet();
+    }).then(function () {
+      render();
+    }).catch(function () {
+      S.jtBusy = false;
+      S.jtMessage = 'The write stopped. Run it again. Existing rows are not duplicated.';
+      render();
+    });
   }
 
   function labelsHtml() {
@@ -546,6 +700,7 @@
     else if (S.screen === 'home') app.innerHTML = homeHtml();
     else if (S.screen === 'admin') app.innerHTML = adminHtml();
     else if (S.screen === 'labels') app.innerHTML = labelsHtml();
+    else if (S.screen === 'jt') app.innerHTML = jtHtml();
     else app.innerHTML = stageHtml();
     var input = $('code-input');
     if (input && !S.scanner) input.focus();
@@ -632,6 +787,17 @@
       }
       S.dash = S.model ? L.buildAdminDashboard(S.model, new Date(), null) : null;
       S.screen = 'admin';
+      render();
+      return;
+    }
+    if (target === 'jt') {
+      if (!L.roleCanUseAdmin(S.staff)) {
+        S.screen = 'denied';
+        render();
+        return;
+      }
+      S.screen = 'jt';
+      S.jtMessage = '';
       render();
       return;
     }
@@ -928,6 +1094,7 @@
     else if (el.getAttribute('data-action') === 'short') submitShort();
     else if (el.getAttribute('data-action') === 'done') nextStep();
     else if (el.getAttribute('data-action') === 'print-labels') printLabels();
+    else if (el.getAttribute('data-action') === 'jt-write') writeJtPlan();
     else if (el.getAttribute('data-action') === 'mode-a4' || el.getAttribute('data-action') === 'mode-thermal') {
       S.labelMode = el.getAttribute('data-action') === 'mode-a4' ? 'a4' : 'thermal';
       render();
@@ -952,6 +1119,14 @@
   document.body.addEventListener('change', function (event) {
     var sku = event.target.getAttribute && event.target.getAttribute('data-sku');
     var qty = event.target.getAttribute && event.target.getAttribute('data-qty');
+    if (event.target && event.target.id === 'jt-file' && event.target.files && event.target.files[0]) {
+      var file = event.target.files[0];
+      loadXlsx().then(function () { readJtFile(file); }).catch(function () {
+        S.jtMessage = 'Could not load the spreadsheet reader.';
+        render();
+      });
+      return;
+    }
     if (sku) S.labelOn[sku] = !!event.target.checked;
     if (qty) S.labelQty[qty] = Math.max(1, Math.min(100, parseInt(event.target.value, 10) || 1));
   });

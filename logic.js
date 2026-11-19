@@ -34,8 +34,8 @@
     },
     ITEMS: {
       name: 'ITEMS',
-      headers: ['SKU', 'Client', 'Product Name', 'Barcode', 'Beginning Qty', 'Active'],
-      fields: ['sku', 'client', 'productName', 'barcode', 'beginningQty', 'active']
+      headers: ['SKU', 'Client', 'Product Name', 'Barcode', 'Beginning Qty', 'Active', 'J&T Alias'],
+      fields: ['sku', 'client', 'productName', 'barcode', 'beginningQty', 'active', 'jtAlias']
     },
     SKU_MAP: {
       name: 'SKU_MAP',
@@ -44,8 +44,8 @@
     },
     WAYBILLS: {
       name: 'WAYBILLS',
-      headers: ['Waybill No', 'Client', 'Item String', 'Order Date', 'Imported At', 'J&T Status', 'Pickup Time', 'Raw Items'],
-      fields: ['waybillNo', 'client', 'itemString', 'orderDate', 'importedAt', 'jtStatus', 'pickupTime', 'rawItems']
+      headers: ['Waybill No', 'Client', 'Item String', 'Order Date', 'Imported At', 'J&T Status', 'Pickup Time', 'Raw Items', 'Signing Time', 'RTS Reason', 'Unmapped'],
+      fields: ['waybillNo', 'client', 'itemString', 'orderDate', 'importedAt', 'jtStatus', 'pickupTime', 'rawItems', 'signingTime', 'rtsReason', 'unmapped']
     },
     SCANS: {
       name: 'SCANS',
@@ -99,6 +99,7 @@
     TOO_LONG: 'Too long (max 64 characters)',
     LOADING: 'Still loading',
     STAGE_NOT_ASSIGNED: 'You are not assigned to this stage.',
+    UNMAPPED: 'Unmapped items. Map the J&T name before picking.',
     OK: 'OK'
   };
 
@@ -628,9 +629,12 @@
       client: normalizeClient(waybill.client),
       clientLabel: clientLabel(waybill.client),
       itemString: waybill.itemString || '',
+      unmapped: String(waybill.unmapped || '').trim(),
       orderDate: waybill.orderDate || '',
       jtStatus: waybill.jtStatus || '',
       pickupTime: waybill.pickupTime || '',
+      signingTime: waybill.signingTime || '',
+      rtsReason: waybill.rtsReason || '',
       pickedUp: isPickedUp(waybill.jtStatus, waybill.pickupTime, config),
       lines: lines,
       pickComplete: pickComplete,
@@ -977,6 +981,11 @@
         waybill: waybillNo,
         details: code ? code + ' @ ' + stage : stage
       };
+    }
+
+    if (String(view.unmapped || '').trim() && action !== 'SHORTAGE') {
+      var unmappedText = 'Unmapped items: ' + String(view.unmapped).trim() + '. Map the J&T name before picking.';
+      return errorDecision(view, stage, 'UNKNOWN_ITEM', unmappedText, '', 0, String(view.unmapped).trim());
     }
 
     if (view.pickedUp && action !== 'SHORTAGE') {
@@ -1471,6 +1480,234 @@
     return bits.join('; ');
   }
 
+  var JT_CREATORS = {
+    'NEL-F2003-0048': 'TREXO',
+    'NEL-F2003-0031': 'SIRWEN',
+    'NEL-F2003-0014': 'ECOM'
+  };
+
+  function jtCreatorClient(code) {
+    return JT_CREATORS[String(code || '').trim().toUpperCase()] || '';
+  }
+
+  function jtField(row, header, fallback) {
+    var src = row || {};
+    if (src[header] != null && String(src[header]).trim() !== '') return String(src[header]).trim();
+    if (fallback && src[fallback] != null && String(src[fallback]).trim() !== '') return String(src[fallback]).trim();
+    return '';
+  }
+
+  function jtExportView(row) {
+    return {
+      creatorCode: jtField(row, 'Creator Code', 'creatorCode'),
+      waybillNo: normWaybill(jtField(row, 'Waybill Number', 'waybillNo')),
+      orderStatus: jtField(row, 'Order Status', 'orderStatus'),
+      signingTime: jtField(row, 'SigningTime', 'signingTime'),
+      submissionTime: jtField(row, 'Submission Time', 'submissionTime'),
+      rtsReason: jtField(row, 'RTS Reason', 'rtsReason'),
+      itemName: jtField(row, 'Item Name', 'itemName')
+    };
+  }
+
+  function parseJtItemName(text) {
+    var raw = String(text || '').trim();
+    if (!raw) return [];
+    var parts = raw.split('+');
+    var out = [];
+    parts.forEach(function (part) {
+      var token = String(part || '').trim();
+      if (!token) return;
+      var match = token.match(/^(\d+)\s*x\s*(.+)$/i);
+      if (!match) {
+        out.push({ name: token, qty: 1 });
+        return;
+      }
+      out.push({ name: String(match[2]).trim(), qty: clampQty(match[1]) });
+    });
+    return out.filter(function (part) { return part.name; });
+  }
+
+  function aliasList(value) {
+    return String(value || '').split(',').map(function (part) {
+      return part.trim().toLowerCase();
+    }).filter(Boolean);
+  }
+
+  function findJtItem(items, name, client) {
+    var want = String(name || '').trim().toLowerCase();
+    var hint = normalizeClient(client);
+    if (!want) return null;
+    var rows = (items || []).filter(function (item) {
+      return isActiveItem(item) && normalizeClient(item.client) === hint;
+    });
+    for (var i = 0; i < rows.length; i++) {
+      if (aliasList(rows[i].jtAlias).indexOf(want) !== -1) return rows[i];
+    }
+    var sku = normalizeSku(name);
+    for (var j = 0; j < rows.length; j++) {
+      if (normalizeSku(rows[j].sku) === sku) return rows[j];
+    }
+    return null;
+  }
+
+  function mapJtNames(parts, client, items) {
+    var mapped = [];
+    var unknown = [];
+    var seen = {};
+    (parts || []).forEach(function (part) {
+      var item = findJtItem(items, part.name, client);
+      if (!item) {
+        var key = String(part.name).trim().toLowerCase();
+        if (key && !seen[key]) {
+          seen[key] = true;
+          unknown.push(String(part.name).trim());
+        }
+        return;
+      }
+      mapped.push({
+        sku: normalizeSku(item.sku),
+        qty: part.qty,
+        client: normalizeClient(item.client),
+        name: item.productName || ''
+      });
+    });
+    return { items: mergeQty(mapped), unknown: unknown };
+  }
+
+  function waybillHasScan(scans, waybillNo) {
+    var want = normWaybill(waybillNo);
+    return (scans || []).some(function (scan) {
+      return normWaybill(scan.waybill) === want && String(scan.result || '').toUpperCase() === 'OK';
+    });
+  }
+
+  /**
+   * J&T My Waybill export. Keeps three creator codes, never stores personal
+   * columns, and does not deduct stock. Re-import updates status fields only,
+   * unless the waybill is still unmapped and nobody has scanned it.
+   */
+  function planJtExport(rows, model, now) {
+    var moment = now || new Date();
+    var inserts = [];
+    var updates = [];
+    var flags = [];
+    var byClient = { TREXO: 0, SIRWEN: 0, ECOM: 0 };
+    var unknownCounts = {};
+    var dropped = 0;
+    var seen = {};
+    var fresh = {};
+    var noted = {};
+    (model.waybills || []).forEach(function (row) {
+      seen[normWaybill(row.waybillNo)] = row;
+    });
+
+    function noteUnknown(client, waybillNo, names) {
+      var text = (names || []).filter(Boolean).join(', ');
+      if (!text || noted[waybillNo]) return;
+      noted[waybillNo] = true;
+      text.split(',').forEach(function (name) {
+        var clean = name.trim();
+        if (!clean) return;
+        var key = client + '|' + clean.toLowerCase();
+        unknownCounts[key] = unknownCounts[key] || { client: client, name: clean, count: 0 };
+        unknownCounts[key].count += 1;
+      });
+      var unknownFlag = makeFlag(moment, waybillNo, client, 'UNKNOWN_ITEM', 'Unmapped: ' + text, 'IMPORT');
+      unknownFlag.itemKey = normalizeItemKey(text);
+      pushFlag(flags, model.flags, unknownFlag, 'item');
+    }
+
+    (rows || []).forEach(function (source) {
+      var row = jtExportView(source);
+      var client = jtCreatorClient(row.creatorCode);
+      if (!client || !row.waybillNo) {
+        dropped += 1;
+        return;
+      }
+      byClient[client] += 1;
+      var parsed = mapJtNames(parseJtItemName(row.itemName), client, model.items);
+      var existing = seen[row.waybillNo];
+      if (!existing) {
+        var created = {
+          waybillNo: row.waybillNo,
+          client: client,
+          itemString: parsed.items.length ? formatItemString(parsed.items) : '',
+          rawItems: row.itemName,
+          orderDate: asDateOnly(row.submissionTime),
+          importedAt: formatManila(moment),
+          jtStatus: row.orderStatus,
+          pickupTime: '',
+          signingTime: row.signingTime,
+          rtsReason: row.rtsReason,
+          unmapped: parsed.unknown.join(', ')
+        };
+        inserts.push(created);
+        seen[row.waybillNo] = created;
+        fresh[row.waybillNo] = created;
+        noteUnknown(client, row.waybillNo, parsed.unknown);
+        return;
+      }
+      if (fresh[row.waybillNo]) {
+        existing.jtStatus = row.orderStatus || existing.jtStatus;
+        existing.signingTime = row.signingTime || existing.signingTime;
+        existing.rtsReason = row.rtsReason || existing.rtsReason;
+        return;
+      }
+      var prior = null;
+      for (var u = 0; u < updates.length; u++) {
+        if (updates[u].waybillNo === row.waybillNo) prior = updates[u];
+      }
+      if (prior) {
+        prior.jtStatus = row.orderStatus || prior.jtStatus;
+        prior.signingTime = row.signingTime || prior.signingTime;
+        prior.rtsReason = row.rtsReason || prior.rtsReason;
+        return;
+      }
+      var scanned = waybillHasScan(model.scans, row.waybillNo);
+      var remap = !scanned && String(existing.unmapped || '').trim();
+      var update = {
+        _row: existing._row,
+        waybillNo: row.waybillNo,
+        client: existing.client,
+        jtStatus: row.orderStatus,
+        signingTime: row.signingTime,
+        rtsReason: row.rtsReason,
+        pickupTime: existing.pickupTime || '',
+        itemString: existing.itemString || '',
+        rawItems: existing.rawItems || '',
+        unmapped: existing.unmapped || '',
+        remap: !!remap
+      };
+      if (remap) {
+        update.itemString = parsed.items.length ? formatItemString(parsed.items) : (existing.itemString || '');
+        update.rawItems = row.itemName || existing.rawItems || '';
+        update.unmapped = parsed.unknown.join(', ');
+      }
+      updates.push(update);
+      if (String(update.unmapped || '').trim()) noteUnknown(client, row.waybillNo, String(update.unmapped).split(','));
+    });
+
+    var unknownItems = Object.keys(unknownCounts).map(function (key) { return unknownCounts[key]; });
+    unknownItems.sort(function (a, b) { return b.count - a.count || (a.name < b.name ? -1 : 1); });
+    return {
+      dropped: dropped,
+      byClient: byClient,
+      inserts: inserts,
+      updates: updates,
+      flags: flags,
+      ledger: [],
+      unknownItems: unknownItems,
+      preview: {
+        dropped: dropped,
+        byClient: byClient,
+        newWaybills: inserts.length,
+        updated: updates.length,
+        unknownItems: unknownItems,
+        flags: flags.length
+      }
+    };
+  }
+
   /**
    * Plan sheet changes for one J&T paste. Does not deduct twice for the same waybill.
    * Mapped SKUs are deducted even when part of the text is unknown.
@@ -1614,7 +1851,10 @@
       orderDate: record.orderDate,
       importedAt: record.importedAt,
       jtStatus: record.jtStatus,
-      pickupTime: record.pickupTime
+      pickupTime: record.pickupTime,
+      signingTime: record.signingTime || '',
+      rtsReason: record.rtsReason || '',
+      unmapped: record.unmapped || ''
     };
   }
 
@@ -1776,7 +2016,35 @@
 
   function cellHasContent(value) {
     if (value == null || value === false || value === true) return false;
-    return String(value).trim() !== '';
+    var text = String(value).trim();
+    if (!text) return false;
+    var upper = text.toUpperCase();
+    if (upper === 'FALSE' || upper === 'TRUE') return false;
+    return true;
+  }
+
+  /**
+   * Checkbox validation can leave the word FALSE in rows that have no person.
+   * Those offsets (0-based in the body) should be cleared. Real staff rows stay.
+   */
+  function falseOnlySpans(keys, values) {
+    var spans = [];
+    var start = -1;
+    var rows = values || [];
+    for (var i = 0; i < rows.length; i++) {
+      var key = keys && keys[i] ? keys[i][0] : '';
+      var cell = rows[i] ? rows[i][0] : '';
+      var emptyKey = !String(key == null ? '' : key).trim();
+      var falseCell = cell === false || String(cell == null ? '' : cell).trim().toUpperCase() === 'FALSE';
+      if (emptyKey && falseCell) {
+        if (start < 0) start = i;
+      } else if (start >= 0) {
+        spans.push({ start: start, count: i - start });
+        start = -1;
+      }
+    }
+    if (start >= 0) spans.push({ start: start, count: rows.length - start });
+    return spans;
   }
 
   function isBlankSheetRow(row) {
@@ -1984,7 +2252,10 @@
       record.importedAt || '',
       record.jtStatus || '',
       record.pickupTime || '',
-      record.rawItems || ''
+      record.rawItems || '',
+      record.signingTime || '',
+      record.rtsReason || '',
+      record.unmapped || ''
     ];
   }
 
@@ -2010,6 +2281,35 @@
       record.staff || '',
       record.resolved === true
     ];
+  }
+
+  function commitJtExport(ss, plan) {
+    var sheet = ss.getSheetByName(SHEETS.WAYBILLS.name);
+    var fields = SHEETS.WAYBILLS.fields;
+    function writeCell(rowNumber, field, value) {
+      var col = fields.indexOf(field) + 1;
+      if (rowNumber && col > 0) sheet.getRange(rowNumber, col).setValue(value || '');
+    }
+    (plan.updates || []).forEach(function (update) {
+      if (!update._row) return;
+      writeCell(update._row, 'jtStatus', update.jtStatus);
+      writeCell(update._row, 'signingTime', update.signingTime);
+      writeCell(update._row, 'rtsReason', update.rtsReason);
+      if (update.remap) {
+        writeCell(update._row, 'itemString', update.itemString);
+        writeCell(update._row, 'rawItems', update.rawItems);
+        writeCell(update._row, 'unmapped', update.unmapped);
+      }
+    });
+    var waybillStart = appendMatrix(sheet, (plan.inserts || []).map(waybillToRow));
+    var flagStart = appendMatrix(ss.getSheetByName(SHEETS.FLAGS.name), (plan.flags || []).map(flagToRow));
+    return {
+      inserted: (plan.inserts || []).length,
+      updated: (plan.updates || []).length,
+      flags: (plan.flags || []).length,
+      waybillStart: waybillStart,
+      flagStart: flagStart
+    };
   }
 
   function commitImport(ss, plan) {
@@ -2159,6 +2459,7 @@
         if (row[c] !== '' && row[c] != null) blank = false;
       }
       if (blank) continue;
+      if (!cellHasContent(row[0])) continue;
       var record = { _row: i + 1 };
       for (var f = 0; f < fields.length; f++) {
         record[fields[f]] = row[f] == null ? '' : row[f];
@@ -2192,7 +2493,7 @@
           pack: row.pack,
           dispatch: row.dispatch
         };
-      }),
+      }).filter(function (row) { return row.email; }),
       settings: settingsFromRows(raw.settings),
       items: (raw.items || []).map(function (row) {
         return {
@@ -2202,7 +2503,8 @@
           productName: String(row.productName || '').trim(),
           barcode: row.barcode == null ? '' : String(row.barcode).trim(),
           beginningQty: num(row.beginningQty),
-          active: isTruthy(row.active)
+          active: isTruthy(row.active),
+          jtAlias: String(row.jtAlias || '').trim()
         };
       }),
       skuMap: (raw.skuMap || []).map(function (row) {
@@ -2223,7 +2525,10 @@
           orderDate: asDateOnly(row.orderDate),
           importedAt: asManilaString(row.importedAt),
           jtStatus: String(row.jtStatus || '').trim(),
-          pickupTime: hasPickupTime(row.pickupTime) ? asManilaString(row.pickupTime) : ''
+          pickupTime: hasPickupTime(row.pickupTime) ? asManilaString(row.pickupTime) : '',
+          signingTime: String(row.signingTime || '').trim(),
+          rtsReason: String(row.rtsReason || '').trim(),
+          unmapped: String(row.unmapped || '').trim()
         };
       }),
       scans: (raw.scans || []).map(function (row) {
@@ -2565,12 +2870,18 @@
     rowToImport: rowToImport,
     rowsFromImportSheet: rowsFromImportSheet,
     planJtImport: planJtImport,
+    planJtExport: planJtExport,
+    parseJtItemName: parseJtItemName,
+    jtCreatorClient: jtCreatorClient,
+    jtExportView: jtExportView,
+    falseOnlySpans: falseOnlySpans,
     planAutoFlags: planAutoFlags,
     ledgerHasShipOut: ledgerHasShipOut,
     buildAdminDashboard: buildAdminDashboard,
     onHand: onHand,
     stockFormulasForRow: stockFormulasForRow,
     commitImport: commitImport,
+    commitJtExport: commitJtExport,
     refreshStockFormulas: refreshStockFormulas,
     recordsToMatrix: recordsToMatrix,
     writeTable: writeTable,
