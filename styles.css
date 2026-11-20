@@ -40,7 +40,9 @@
   }
   .brand-lock { min-width: 0; }
   .brand-logo { display: block; height: 36px; width: auto; max-height: 36px; object-fit: contain; }
-  .stage-tag { font-size: 12px; font-weight: 800; letter-spacing: 0.08em; color: var(--red); margin-top: 1px; }
+  .stage-tag { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 800; letter-spacing: 0.08em; color: var(--red); margin-top: 1px; }
+  .sheet-badge { display: inline-block; font-size: 10px; font-weight: 800; letter-spacing: 0.08em; line-height: 1.4; border-radius: 999px; padding: 2px 6px; background: #111; color: #fff; }
+  .sheet-badge.test { background: #e36b00; color: #fff; }
   .back, .back-spacer { width: 64px; }
   .back {
     height: 36px;

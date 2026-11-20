@@ -3,11 +3,12 @@
 
   var L = window.VendesLogic;
   var CFG = window.VENDES_WEB || {};
+  var Keys = window.VendesPwaKeys;
   var params = new URLSearchParams(location.search);
-  var QUEUE_KEY = 'vendes.pwa.queue';
-  var MODEL_KEY = 'vendes.pwa.model';
-  var STAFF_KEY = 'vendes.pwa.staff';
-  var TOKEN_KEY = 'vendes.pwa.token';
+  var QUEUE_KEY = Keys.storageKey(CFG.spreadsheetId, 'queue');
+  var MODEL_KEY = Keys.storageKey(CFG.spreadsheetId, 'model');
+  var STAFF_KEY = Keys.storageKey(CFG.spreadsheetId, 'staff');
+  var TOKEN_KEY = Keys.storageKey(CFG.spreadsheetId, 'token');
 
   var S = {
     demo: params.get('demo') === '1',
@@ -363,6 +364,12 @@
     });
   }
 
+  function sheetBadgeHtml() {
+    var label = String(CFG.sheetLabel || '').trim().toUpperCase();
+    if (!label) return '';
+    return '<span class="sheet-badge' + (label === 'TEST' ? ' test' : '') + '">' + esc(label) + '</span>';
+  }
+
   function headerHtml(tag) {
     var back = '<span class="back-spacer"></span>';
     if (S.screen !== 'home' && S.screen !== 'denied' && S.screen !== 'signin' && S.screen !== 'setup' && S.screen !== 'loading') {
@@ -371,7 +378,7 @@
     var label = L.pendingLabel(pendingCount(), S.online, S.syncing);
     var state = S.syncing || pendingCount() ? 'saving' : (S.online ? 'saved' : 'saving');
     return '<header>' + back +
-      '<div class="brand-lock"><img class="brand-logo" src="brand/vendes-logo.png" alt="VENDES"><div class="stage-tag">' + esc(tag || 'Warehouse') + '</div></div>' +
+      '<div class="brand-lock"><img class="brand-logo" src="brand/vendes-logo.png" alt="VENDES"><div class="stage-tag">' + esc(tag || 'Warehouse') + sheetBadgeHtml() + '</div></div>' +
       '<div id="save-pill" class="save ' + state + '">' + esc(label) + '</div></header>' +
       (S.online ? '' : '<div class="offline-bar">Offline. Scans stay on this phone and sync when you reconnect.</div>');
   }
@@ -426,7 +433,7 @@
 
   function stageHtml() {
     var hint = '';
-    if (!S.payload) hint = '<p class="hint">' + esc(S.pendingScan ? L.MSG.SCAN_SAVED : L.MSG.LOADING) + '</p>';
+    if (!S.payload) hint = '<p class="hint">' + esc(L.MSG.LOADING) + '</p>';
     else if (S.stage === 'DISPATCH') hint = '<p class="hint">Scan the waybill. Rider handover. It must be fully packed.</p>';
     else if (!currentView()) hint = '<p class="hint">Scan the waybill. The camera and a Bluetooth scanner both work.</p>';
     else {
@@ -462,7 +469,7 @@
       '<button type="button" class="wide cam" id="cam-btn" data-action="camera">' + (S.scanner ? 'Close camera' : 'Open camera') + '</button>' +
       '<div id="reader" hidden></div>' +
       '<form id="scan-form"><input id="code-input" maxlength="64" autocomplete="off" autocapitalize="characters" enterkeyhint="go"' +
-      ' placeholder="' + esc(S.checking ? 'Checking…' : (S.pendingScan ? L.MSG.SCAN_SAVED : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode'))) + '">' +
+      ' placeholder="' + esc(S.checking ? 'Checking…' : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode')) + '">' +
       '<button type="submit" id="add-btn"' + (S.checking ? ' disabled' : '') + '>Add</button></form>' +
       short +
       '<button type="button" class="wide good" data-action="done"' + (doneOff ? ' disabled' : '') + '>' + doneLabel + '</button></main>';
@@ -765,7 +772,7 @@
       var live = $('live');
       var view = currentView();
       var hint = '';
-      if (!S.payload) hint = '<p class="hint">' + esc(S.pendingScan ? L.MSG.SCAN_SAVED : L.MSG.LOADING) + '</p>';
+      if (!S.payload) hint = '<p class="hint">' + esc(L.MSG.LOADING) + '</p>';
       else if (S.stage === 'DISPATCH') hint = '<p class="hint">Scan the waybill. Rider handover. It must be fully packed.</p>';
       else if (!view) hint = '<p class="hint">Scan the waybill. The camera and a Bluetooth scanner both work.</p>';
       else hint = '<div class="card"><div class="wb">' + esc(view.waybillNo) + '</div><span class="pill" data-client="' + esc(view.client) + '">' + esc(view.clientLabel) + '</span></div>';
@@ -790,7 +797,7 @@
       if (input && !S.scanner) {
         input.disabled = false;
         input.readOnly = !!S.checking;
-        input.placeholder = S.checking ? 'Checking…' : (S.pendingScan ? L.MSG.SCAN_SAVED : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode'));
+        input.placeholder = S.checking ? 'Checking…' : (S.stage === 'DISPATCH' || !S.waybillNo ? 'Type the waybill' : 'Type the SKU or barcode');
       }
       var add = $('add-btn');
       if (add) add.disabled = !!S.checking;
@@ -1297,20 +1304,33 @@
     paint();
   });
 
+  function watchServiceWorker() {
+    if (!('serviceWorker' in navigator)) return;
+    var hadController = !!navigator.serviceWorker.controller;
+    var reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', function () {
+      if (!hadController || reloading) return;
+      reloading = true;
+      window.location.reload();
+    });
+    navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(function () {});
+  }
+
   function boot() {
     if (!L) {
       document.body.textContent = 'Scan logic did not load.';
       return;
     }
+    var legacyNotice = '';
+    try { legacyNotice = Keys.retireLegacyQueue(window.localStorage); } catch (err) { legacyNotice = ''; }
     loadQueue();
+    if (legacyNotice) S.banner = { kind: 'warn', text: legacyNotice };
+    watchServiceWorker();
     if (S.demo) {
       startDemo();
       return;
     }
     loadCache();
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('./sw.js').catch(function () {});
-    }
     if (!configured()) {
       S.screen = 'setup';
       render();

@@ -1,10 +1,12 @@
-var CACHE = 'vendes-scan-v10';
+var CACHE = 'vendes-scan-live-v1';
+var CACHE_FAMILY = /^vendes-scan-live-|^vendes-scan-v\d+$/;
 var SHELL = [
   './',
   './index.html',
   './styles.css',
   './app.js',
   './logic.js',
+  './pwa-keys.js',
   './config.js',
   './manifest.webmanifest',
   './icon-192.png',
@@ -25,7 +27,9 @@ self.addEventListener('install', function (event) {
 
 self.addEventListener('activate', function (event) {
   event.waitUntil(caches.keys().then(function (keys) {
-    return Promise.all(keys.filter(function (key) { return key !== CACHE; }).map(function (key) {
+    return Promise.all(keys.filter(function (key) {
+      return key !== CACHE && CACHE_FAMILY.test(key);
+    }).map(function (key) {
       return caches.delete(key);
     }));
   }).then(function () {

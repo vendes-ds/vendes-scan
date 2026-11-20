@@ -1420,6 +1420,7 @@
     var flags = [];
     var knownIds = scanIdSet(model.scans);
     var touched = {};
+    var seenBlocks = {};
 
     (events || []).forEach(function (event) {
       var localId = String((event && event.localId) || '').trim();
@@ -1449,7 +1450,18 @@
         samePersonStages: samePersonEnabled(ruleSource),
         waybillNos: waybillIndex(model.waybills)
       });
-      if (decision.result === 'BLOCKED' && blockedWithin(model.scans, staff, decision.waybill || waybillNo, decision.stage, moment)) {
+      var reason = blockReason(decision);
+      var blockId = blockKey(staff, decision.waybill || waybillNo, decision.stage, reason);
+      var blockStore = model.blockSeen;
+      var storedAt = 0;
+      if (blockStore && typeof blockStore.lookup === 'function') storedAt = Number(blockStore.lookup(blockId)) || 0;
+      else if (blockStore) storedAt = Number(blockStore[blockId]) || 0;
+      var seenRecently = decision.result === 'BLOCKED' && (
+        seenBlocks[blockId] ||
+        (storedAt && (moment.getTime() - storedAt) < 60000) ||
+        blockedWithin(model.scans, staff, decision.waybill || waybillNo, decision.stage, moment, reason)
+      );
+      if (seenRecently) {
         applied.push({
           localId: localId,
           result: 'BLOCKED',
@@ -1462,6 +1474,7 @@
         });
         return;
       }
+      if (decision.result === 'BLOCKED') seenBlocks[blockId] = true;
       var scan = {
         timestamp: formatManila(moment),
         staffEmail: normalizeEmail(staff && staff.email),
@@ -1471,8 +1484,14 @@
         sku: clipScanText(decision.sku || ''),
         qty: decision.qty || 0,
         result: decision.result,
-        message: withId(localId, decision.logMessage || '')
+        message: withId(localId, decision.logMessage || ''),
+        blockReason: decision.result === 'BLOCKED' ? reason : '',
+        _blockMs: decision.result === 'BLOCKED' ? moment.getTime() : 0
       };
+      if (decision.result === 'BLOCKED' && blockStore) {
+        if (typeof blockStore.note === 'function') blockStore.note(blockId, moment.getTime());
+        else blockStore[blockId] = moment.getTime();
+      }
       model.scans.push(scan);
       if (localId) knownIds[localId] = scan;
       touched[scan.waybill] = true;
@@ -2125,21 +2144,51 @@
     return { done: done, short: shortCount };
   }
 
-  function blockedWithin(scans, staff, waybill, stage, now) {
+  function blockReason(decision) {
+    var text = String(decision && (decision.message || decision.logMessage) || '').trim();
+    if (text) return text.toUpperCase();
+    return String(decision && decision.flag || '').toUpperCase();
+  }
+
+  function blockKey(staff, waybill, stage, reason) {
+    return [
+      normalizeEmail(staff && staff.email),
+      normWaybill(waybill),
+      String(stage || '').toUpperCase(),
+      String(reason || '').toUpperCase()
+    ].join('|');
+  }
+
+  function blockedWithin(scans, staff, waybill, stage, now, reason) {
     var email = normalizeEmail(staff && staff.email);
     var want = normWaybill(waybill);
     var stageName = String(stage || '').toUpperCase();
+    var why = String(reason || '').toUpperCase();
     var moment = (now || new Date()).getTime();
     return (scans || []).some(function (scan) {
       if (String(scan.result || '').toUpperCase() !== 'BLOCKED') return false;
       if (normalizeEmail(scan.staffEmail) !== email) return false;
       if (normWaybill(scan.waybill) !== want) return false;
       if (String(scan.stage || '').toUpperCase() !== stageName) return false;
+      if (why) {
+        var body = String(messageParts(scan.message).body || scan.message || '').toUpperCase();
+        var scanWhy = String(scan.blockReason || '').toUpperCase();
+        if (scanWhy !== why && body.indexOf(why) === -1) return false;
+      }
+      if (scan._blockMs) {
+        var known = moment - Number(scan._blockMs);
+        return known >= 0 && known < 60000;
+      }
       var when = parseManila(scan.timestamp);
       if (!when) return false;
-      var age = moment - when.getTime();
-      return age >= 0 && age < 60000;
+      var age = Math.abs(moment - when.getTime());
+      return age < 60000;
     });
+  }
+
+  function saveSheetReads(cacheFresh) {
+    if (cacheFresh) return ['FLAGS'];
+    return ['ITEMS', 'WAYBILLS', 'SCANS', 'FLAGS', 'SETTINGS'];
   }
 
   function staffEmailOfFlag(flag) {
@@ -3287,6 +3336,9 @@
     nextBanner: nextBanner,
     countStageToday: countStageToday,
     blockedWithin: blockedWithin,
+    blockKey: blockKey,
+    blockReason: blockReason,
+    saveSheetReads: saveSheetReads,
     missingStageMessage: missingStageMessage,
     clearSheetBody: clearSheetBody,
     onHand: onHand,
