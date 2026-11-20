@@ -390,7 +390,13 @@
     return '<span class="sheet-badge' + (label === 'TEST' ? ' test' : '') + '">' + esc(label) + '</span>';
   }
 
+  function browserOnline() {
+    if (params.get('offline') === '1') return false;
+    return typeof navigator === 'undefined' || navigator.onLine !== false;
+  }
+
   function headerHtml(tag) {
+    S.online = browserOnline();
     var back = '<span class="back-spacer"></span>';
     if (S.screen !== 'home' && S.screen !== 'denied' && S.screen !== 'signin' && S.screen !== 'setup' && S.screen !== 'loading') {
       back = '<button type="button" class="back" data-go="home">Back</button>';
@@ -515,7 +521,7 @@
     var backlog = buckets.map(function (pair) {
       var list = (S.dash.backlog && S.dash.backlog[pair[0]]) || [];
       return '<div class="back-row"><div><div>' + pair[1] + '</div><div class="chips">' +
-        esc(list.slice(0, 3).map(function (item) { return L.clipDisplay(item); }).join('  ')) +
+        esc(list.map(function (item) { return L.clipDisplay(item); }).join('  ')) +
         '</div></div><b>' + list.length + '</b></div>';
     }).join('');
     var flagRows = (S.dash.flags || []).slice();
@@ -789,8 +795,9 @@
       var checked = S.labelOn[key] ? ' checked' : '';
       return '<div class="sku-row"><label><input type="checkbox" data-key="' + esc(key) + '"' + checked + '> <b>' +
         esc(item.sku) + '</b></label><span class="chips">' + esc(item.clientLabel) + ' · ' + esc(item.name) +
-        (item.barcode ? ' · ' + esc(item.barcode) : '') +
-        '</span><input type="number" min="1" max="100" value="' + qty + '" data-qty="' + esc(key) + '"></div>';
+        (item.barcode ? ' · ' + esc(item.barcode) : ' · no barcode') +
+        '</span>' + (item.barcode ? '' : '<button type="button" data-action="print-one" data-sku="' + esc(item.sku) + '">Print SKU label</button>') +
+        '<input type="number" min="1" max="100" value="' + qty + '" data-qty="' + esc(key) + '"></div>';
     }).join('') || '<p class="hint">No SKUs.</p>';
     return headerHtml('Labels') + '<main><div class="modes">' +
       '<button type="button" class="' + (S.labelMode === 'a4' ? 'on' : '') + '" data-action="mode-a4">A4 sheet</button>' +
@@ -936,7 +943,12 @@
   }
 
   function returnHtml() {
-    var view = S.returnWaybill && S.payload && S.payload.waybills[S.returnWaybill];
+    var record = null;
+    ((S.model && S.model.waybills) || []).forEach(function (row) {
+      if (L.normWaybill(row.waybillNo) === S.returnWaybill) record = row;
+    });
+    var view = record ? L.buildWaybillView(record, S.model.items, S.model.scans, null) : null;
+    if (view && L.alreadyReturned(S.model, S.returnWaybill)) view = null;
     var lines = '';
     if (view) {
       lines = (view.lines || []).filter(function (line) { return !line.unknown; }).map(function (line, index) {
@@ -956,13 +968,15 @@
 
   function receiveHtml() {
     var query = String(S.receiveCode || '').toUpperCase();
-    var matches = (S.model && S.model.items || []).filter(function (item) {
-      if (item.active === false) return false;
-      if (!query) return false;
-      return String(item.sku || '').toUpperCase().indexOf(query) >= 0
-        || String(item.barcode || '').toUpperCase().indexOf(query) >= 0
-        || String(item.productName || '').toUpperCase().indexOf(query) >= 0;
-    }).slice(0, 8);
+    var source = query
+      ? (S.model && S.model.items || []).filter(function (item) {
+        if (item.active === false) return false;
+        return String(item.sku || '').toUpperCase().indexOf(query) >= 0
+          || String(item.barcode || '').toUpperCase().indexOf(query) >= 0
+          || String(item.productName || '').toUpperCase().indexOf(query) >= 0;
+      })
+      : L.itemsNeedingLabels(S.model && S.model.items);
+    var matches = source.slice(0, 12);
     var list = matches.map(function (item) {
       var print = item.barcode ? '' : '<button type="button" data-action="print-one" data-sku="' + esc(item.sku) + '">Print SKU label</button>';
       return '<button type="button" class="ghost" data-action="pick-receive" data-sku="' + esc(item.sku) + '" data-client="' + esc(item.client) + '">' +
@@ -979,13 +993,27 @@
   function openReturn(code) {
     var no = L.normWaybill(code);
     if (!S.payload) refreshViews();
-    var view = S.payload && S.payload.waybills[no];
-    S.returnWaybill = no;
-    if (!view) {
+    var record = null;
+    ((S.model && S.model.waybills) || []).forEach(function (row) {
+      if (L.normWaybill(row.waybillNo) === no) record = row;
+    });
+    if (!record) {
+      S.returnWaybill = no;
       S.banner = { kind: 'bad', text: L.MSG.UNKNOWN_WB };
-    } else if (L.needsReturnScan({ waybillNo: no, jtStatus: view.jtStatus }, [])) {
-      S.banner = { kind: 'warn', text: 'For return scan' };
+      render();
+      return;
     }
+    if (L.alreadyReturned(S.model, no)) {
+      var event = { action: 'RETURN', stage: 'RETURN', waybill: no, lines: [], scannedAt: new Date().toISOString() };
+      var plan = L.planStockMove(S.model, S.staff, event, new Date());
+      S.banner = { kind: 'bad', text: plan.applied.message };
+      S.returnWaybill = '';
+      enqueue(event, false);
+      render();
+      return;
+    }
+    S.returnWaybill = no;
+    if (L.needsReturnScan(record, S.model.scans)) S.banner = { kind: 'warn', text: 'For return scan' };
     render();
   }
 
@@ -1626,10 +1654,18 @@
   }
 
   function noteConnection() {
-    if (params.get('offline') === '1') return;
-    var online = navigator.onLine !== false;
+    if (params.get('offline') === '1') {
+      S.online = false;
+      return;
+    }
+    var online = browserOnline();
     var changed = online !== S.online;
     S.online = online;
+    var pill = $('save-pill');
+    if (pill) {
+      pill.textContent = L.pendingLabel(pendingCount(), S.online, S.syncing);
+      pill.className = 'save ' + (!S.online ? 'saving' : (S.syncing || pendingCount() ? 'saving' : 'saved'));
+    }
     if (changed) paint();
     if (online && pendingCount()) loadGis();
   }
@@ -1678,6 +1714,7 @@
       S.screen = 'signin';
       render();
     }
+    noteConnection();
     if (S.online) loadGis();
   }
 

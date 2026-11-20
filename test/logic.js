@@ -821,7 +821,8 @@
     var waybills = {};
     (model.waybills || []).forEach(function (waybill) {
       var picked = isPickedUp(waybill.jtStatus, waybill.pickupTime, conf);
-      if (picked) {
+      var keepForReturn = String(waybill.jtStatus || '').toUpperCase() === 'RETURNED' || statusBackForScan(waybill.jtStatus);
+      if (picked && !keepForReturn) {
         var when = parseManila(waybill.pickupTime) || parseManila(waybill.importedAt);
         if (!when) return;
         var age = (moment.getTime() - when.getTime()) / 36e5;
@@ -927,6 +928,12 @@
     return code;
   }
 
+  function itemsNeedingLabels(items) {
+    return (items || []).filter(function (item) {
+      return isActiveItem(item) && !barcodeKey(item.barcode);
+    });
+  }
+
   function assignMissingBarcodes(items) {
     var used = {};
     (items || []).forEach(function (item) {
@@ -935,6 +942,7 @@
     });
     var updates = [];
     (items || []).forEach(function (item) {
+      if (!isActiveItem(item)) return;
       if (barcodeKey(item.barcode)) return;
       var code = internalBarcode(item.sku, used);
       used[code] = true;
@@ -951,7 +959,8 @@
   function saveBarcode(items, sku, client, barcode) {
     var code = barcodeKey(barcode);
     if (!code) return { ok: false, message: 'Enter a barcode.' };
-    if (code128Symbols(code) == null && code128Symbols({ sku: 'X', barcode: code }) == null) {
+    if (code.length < 4) return { ok: false, message: 'Barcode is too short. Use at least 4 characters.' };
+    if (code128Symbols(code) == null) {
       return { ok: false, message: 'Use letters, numbers, and normal symbols only.' };
     }
     var owner = null;
@@ -1549,6 +1558,13 @@
     var text = String(status || '').trim().toLowerCase();
     if (!text || text.indexOf('returning') === 0) return false;
     return text === 'rts' || text.indexOf('returned') === 0 || text.indexOf('rts') === 0;
+  }
+
+  function alreadyReturned(model, waybillNo) {
+    var record = findWaybill(model, waybillNo);
+    if (!record) return false;
+    if (String(record.jtStatus || '').toUpperCase() === 'RETURNED') return true;
+    return hasReturnScan(model && model.scans, waybillNo);
   }
 
   function needsReturnScan(waybill, scans) {
@@ -3142,6 +3158,7 @@
       items: model.items,
       skuMap: model.skuMap,
       waybills: (model.waybills || []).map(function (row) { return Object.assign({}, row); }),
+      settings: model.settings,
       scans: (model.scans || []).slice(),
       flags: (model.flags || []).slice(),
       ledger: (model.ledger || []).slice(),
@@ -3935,6 +3952,8 @@
     saveBarcode: saveBarcode,
     canReceive: canReceive,
     needsReturnScan: needsReturnScan,
+    alreadyReturned: alreadyReturned,
+    itemsNeedingLabels: itemsNeedingLabels,
     planStockMove: planStockMove,
     labelBarcodeValue: labelBarcodeValue,
     labelKey: labelKey,
