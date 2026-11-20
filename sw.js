@@ -40,6 +40,10 @@ self.addEventListener('activate', function (event) {
 self.addEventListener('fetch', function (event) {
   var url = new URL(event.request.url);
   if (event.request.method !== 'GET' || url.origin !== self.location.origin) return;
+  if (url.pathname.indexOf('online-check') !== -1) {
+    event.respondWith(fetch(event.request));
+    return;
+  }
   event.respondWith(fetch(event.request).then(function (response) {
     var copy = response.clone();
     caches.open(CACHE).then(function (cache) { cache.put(event.request, copy); });

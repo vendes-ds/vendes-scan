@@ -24,13 +24,13 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  var SHEET_ORDER = ['STAFF', 'ITEMS', 'SKU_MAP', 'WAYBILLS', 'SCANS', 'FLAGS', 'LEDGER', 'STOCK', 'IMPORT', 'SETTINGS'];
+  var SHEET_ORDER = ['STAFF', 'ITEMS', 'SKU_MAP', 'TO_MAP', 'WAYBILLS', 'SCANS', 'FLAGS', 'LEDGER', 'STOCK', 'IMPORT', 'SETTINGS'];
 
   var SHEETS = {
     STAFF: {
       name: 'STAFF',
-      headers: ['Email', 'Name', 'Role', 'Active', 'Pick', 'Pack', 'Dispatch'],
-      fields: ['email', 'name', 'role', 'active', 'pick', 'pack', 'dispatch']
+      headers: ['Email', 'Name', 'Role', 'Active', 'Pick', 'Pack', 'Dispatch', 'Receive access'],
+      fields: ['email', 'name', 'role', 'active', 'pick', 'pack', 'dispatch', 'receive']
     },
     ITEMS: {
       name: 'ITEMS',
@@ -39,8 +39,13 @@
     },
     SKU_MAP: {
       name: 'SKU_MAP',
-      headers: ['Raw Text', 'Client', 'SKU'],
-      fields: ['raw', 'client', 'sku']
+      headers: ['Raw Text', 'Client', 'SKU', 'Qty'],
+      fields: ['raw', 'client', 'sku', 'qty']
+    },
+    TO_MAP: {
+      name: 'TO_MAP',
+      headers: ['Client', 'Raw item text', 'Token', 'Suggested SKU', 'Waybills', 'First seen', 'Status', 'Approved SKU', 'Approved by', 'Approved at'],
+      fields: ['client', 'raw', 'token', 'suggestedSku', 'waybillCount', 'firstSeen', 'status', 'approvedSku', 'approvedBy', 'approvedAt']
     },
     WAYBILLS: {
       name: 'WAYBILLS',
@@ -64,8 +69,8 @@
     },
     STOCK: {
       name: 'STOCK',
-      headers: ['SKU', 'Client', 'Product Name', 'Beginning', 'Ledger Qty', 'On Hand'],
-      fields: ['sku', 'client', 'productName', 'beginning', 'ledgerQty', 'onHand']
+      headers: ['SKU', 'Client', 'Product Name', 'Beginning', 'Ledger Qty', 'On Hand', 'Damaged'],
+      fields: ['sku', 'client', 'productName', 'beginning', 'ledgerQty', 'onHand', 'damaged']
     },
     IMPORT: {
       name: 'IMPORT',
@@ -118,8 +123,12 @@
       'on the way',
       'out for delivery',
       'delivered',
+      'delivering',
+      'arrival',
       'departed',
-      'departure'
+      'departure',
+      'returning',
+      'returned'
     ],
     pickupTimeMeansPickedUp: true,
     staleDispatchHours: 24,
@@ -517,28 +526,74 @@
     return map['*|' + label] || [];
   }
 
-  function resolveSegment(name, qty, client, items) {
+  function mapMultiplier(value) {
+    var qty = parseInt(value, 10);
+    if (!qty || qty < 1) return 1;
+    if (qty > 999) return 999;
+    return qty;
+  }
+
+  function distinctSkuRows(rows) {
+    var seen = {};
+    var out = [];
+    (rows || []).forEach(function (row) {
+      var sku = normalizeSku(row.sku);
+      var key = normalizeClient(row.client) + '|' + sku;
+      if (!sku || seen[key]) return;
+      seen[key] = true;
+      out.push(row);
+    });
+    return out;
+  }
+
+  function resolveSegment(name, qty, client, items, skuMap) {
     var label = normalizeSku(name);
     var hint = normalizeClient(client);
     if (!label) return unknownSegment(name, qty);
     var lookup = itemLookup(items);
-    function hit(row) {
+    function matched(row, multiplier) {
       return {
         sku: normalizeSku(row.sku),
-        qty: clampQty(qty),
-        client: normalizeClient(row.client),
-        name: row.productName || '',
+        qty: clampQty(qty * (multiplier || 1)),
+        client: normalizeClient(row.client || hint),
+        name: row.productName || row.name || '',
         unknown: false
       };
     }
-    function one(rows) {
-      if (!rows || rows.length !== 1) return null;
-      return hit(rows[0]);
+    function take(rows) {
+      var hits = distinctSkuRows(rows);
+      if (!hits.length) return null;
+      if (hits.length > 1) return { ambiguous: true };
+      return { match: matched(hits[0], 1) };
     }
-    return one(lookupRows(lookup.bySku, hint, label))
-      || one(lookupRows(lookup.byAlias, hint, label))
-      || one(lookupRows(lookup.byName, hint, label))
-      || unknownSegment(name, qty);
+    var steps = [
+      lookupRows(lookup.bySku, hint, label),
+      lookupRows(lookup.byAlias, hint, label),
+      lookupRows(lookup.byName, hint, label)
+    ];
+    for (var s = 0; s < steps.length; s++) {
+      var found = take(steps[s]);
+      if (!found) continue;
+      if (found.ambiguous) return unknownSegment(name, qty);
+      return found.match;
+    }
+    if (!hint) return unknownSegment(name, qty);
+    var mapped = [];
+    (skuMap || []).forEach(function (row) {
+      if (normalizeSku(row.raw) !== label) return;
+      if (normalizeClient(row.client) !== hint) return;
+      var sku = normalizeSku(row.sku);
+      var itemsForSku = lookupRows(lookup.bySku, hint, sku);
+      if (!itemsForSku.length) return;
+      mapped.push(matched(itemsForSku[0], mapMultiplier(row.qty)));
+    });
+    var mappedSkus = distinctSkuRows(mapped);
+    if (mappedSkus.length > 1) return unknownSegment(name, qty);
+    if (mappedSkus.length === 1) {
+      var chosen = mapped.filter(function (row) { return row.sku === mappedSkus[0].sku; })[0];
+      return chosen;
+    }
+    return unknownSegment(name, qty);
   }
 
   function resolveLineItems(rawText, clientHint, skuMap, items) {
@@ -548,7 +603,7 @@
       return { items: [], unknown: [], segments: [], client: hint, itemString: '' };
     }
     var resolved = segments.map(function (seg) {
-      return resolveSegment(seg.name, seg.qty, hint, items);
+      return resolveSegment(seg.name, seg.qty, hint, items, skuMap);
     });
     var good = resolved.filter(function (row) { return !row.unknown; });
     var unknown = [];
@@ -590,7 +645,7 @@
       });
     }
     if (!names.length) return '';
-    return 'Item not in list: ' + names.join(', ') + ' — ask admin';
+    return 'Item not in list: ' + names.join(', ') + ' — an admin must approve the mapping';
   }
 
   function missingStageMessage(view) {
@@ -618,7 +673,7 @@
     var seen = {};
     (scans || []).forEach(function (scan) {
       if (normWaybill(scan.waybill) !== normWaybill(waybillNo)) return;
-      if (String(scan.result || '').toUpperCase() !== 'OK') return;
+      if (String(scan.result || '').trim().toUpperCase() !== 'OK') return;
       var parts = messageParts(scan.message);
       if (parts.id) {
         if (seen[parts.id]) return;
@@ -766,7 +821,8 @@
     var waybills = {};
     (model.waybills || []).forEach(function (waybill) {
       var picked = isPickedUp(waybill.jtStatus, waybill.pickupTime, conf);
-      if (picked) {
+      var keepForReturn = String(waybill.jtStatus || '').toUpperCase() === 'RETURNED' || statusBackForScan(waybill.jtStatus);
+      if (picked && !keepForReturn) {
         var when = parseManila(waybill.pickupTime) || parseManila(waybill.importedAt);
         if (!when) return;
         var age = (moment.getTime() - when.getTime()) / 36e5;
@@ -846,6 +902,75 @@
       return { ok: false, text: clipScanText(text), message: MSG.TOO_LONG };
     }
     return { ok: true, text: text, message: '' };
+  }
+
+  function barcodeKey(value) {
+    return String(value == null ? '' : value).trim().toUpperCase().replace(/\s+/g, '');
+  }
+
+  function code128Safe(text) {
+    return String(text || '').toUpperCase().replace(/[^A-Z0-9\-]/g, '');
+  }
+
+  function internalBarcode(sku, used) {
+    var base = 'VS' + code128Safe(sku);
+    if (base === 'VS') base = 'VSITEM';
+    if (base.length > 40) base = base.slice(0, 40);
+    var code = base;
+    var n = 2;
+    while (used[code]) {
+      var suffix = '-' + n;
+      code = (base + suffix).slice(0, 48);
+      if (code.length < base.length + suffix.length) code = base.slice(0, 48 - suffix.length) + suffix;
+      n += 1;
+      if (n > 9999) break;
+    }
+    return code;
+  }
+
+  function itemsNeedingLabels(items) {
+    return (items || []).filter(function (item) {
+      return isActiveItem(item) && !barcodeKey(item.barcode);
+    });
+  }
+
+  function assignMissingBarcodes(items) {
+    var used = {};
+    (items || []).forEach(function (item) {
+      var code = barcodeKey(item.barcode);
+      if (code) used[code] = true;
+    });
+    var updates = [];
+    (items || []).forEach(function (item) {
+      if (!isActiveItem(item)) return;
+      if (barcodeKey(item.barcode)) return;
+      var code = internalBarcode(item.sku, used);
+      used[code] = true;
+      updates.push({
+        _row: item._row,
+        sku: normalizeSku(item.sku),
+        client: normalizeClient(item.client),
+        barcode: code
+      });
+    });
+    return updates;
+  }
+
+  function saveBarcode(items, sku, client, barcode) {
+    var code = barcodeKey(barcode);
+    if (!code) return { ok: false, message: 'Enter a barcode.' };
+    if (code.length < 4) return { ok: false, message: 'Barcode is too short. Use at least 4 characters.' };
+    if (code128Symbols(code) == null) {
+      return { ok: false, message: 'Use letters, numbers, and normal symbols only.' };
+    }
+    var owner = null;
+    (items || []).forEach(function (item) {
+      if (barcodeKey(item.barcode) !== code) return;
+      if (normalizeSku(item.sku) === normalizeSku(sku) && normalizeClient(item.client) === normalizeClient(client)) return;
+      owner = item;
+    });
+    if (owner) return { ok: false, message: 'That barcode is already used by ' + owner.sku + '.' };
+    return { ok: true, barcode: code };
   }
 
   function labelBarcodeValue(itemOrSku, barcode) {
@@ -1413,16 +1538,172 @@
    * The same localId is ignored on retry so a flaky phone cannot double-count.
    * Ledger is never touched here.
    */
+  function canReceive(staff) {
+    if (!staff || staff.active === false || staff.active === 0) return false;
+    if (staff.active != null && staff.active !== '' && !isTruthy(staff.active) && String(staff.role || '').toUpperCase() !== 'ADMIN') return false;
+    if (String(staff.role || '').toUpperCase() === 'ADMIN') return true;
+    return isTruthy(staff.receive);
+  }
+
+  function hasReturnScan(scans, waybillNo) {
+    var want = normWaybill(waybillNo);
+    return (scans || []).some(function (scan) {
+      return normWaybill(scan.waybill) === want
+        && String(scan.stage || '').toUpperCase() === 'RETURN'
+        && String(scan.result || '').trim().toUpperCase() === 'OK';
+    });
+  }
+
+  function statusBackForScan(status) {
+    var text = String(status || '').trim().toLowerCase();
+    if (!text || text.indexOf('returning') === 0) return false;
+    return text === 'rts' || text.indexOf('returned') === 0 || text.indexOf('rts') === 0;
+  }
+
+  function alreadyReturned(model, waybillNo) {
+    var record = findWaybill(model, waybillNo);
+    if (!record) return false;
+    if (String(record.jtStatus || '').toUpperCase() === 'RETURNED') return true;
+    return hasReturnScan(model && model.scans, waybillNo);
+  }
+
+  function needsReturnScan(waybill, scans) {
+    if (!waybill || !statusBackForScan(waybill.jtStatus)) return false;
+    return !hasReturnScan(scans, waybill.waybillNo);
+  }
+
+  function stockScan(moment, staff, stage, waybill, sku, qty, result, message, localId) {
+    return {
+      timestamp: formatManila(moment),
+      staffEmail: normalizeEmail(staff && staff.email),
+      staffName: (staff && staff.name) || '',
+      stage: stage,
+      waybill: normWaybill(waybill),
+      sku: normalizeSku(sku),
+      qty: qty || 0,
+      result: result,
+      message: withId(localId, message)
+    };
+  }
+
+  function planReturn(model, staff, event, moment) {
+    var waybillNo = normWaybill(event.waybill || event.code);
+    var localId = String(event.localId || '').trim();
+    var record = findWaybill(model, waybillNo);
+    function done(result, message, flagType, ledger, patch) {
+      var row = stockScan(moment, staff, 'RETURN', waybillNo, '', 0, result, message, localId);
+      if (ledger && ledger.length) row._ledger = ledger;
+      if (patch) row._waybill = patch;
+      var flags = [];
+      if (flagType) flags.push(makeFlag(moment, waybillNo, record ? record.client : '', flagType, message, staff));
+      return {
+        applied: { localId: localId, result: result, message: message, duplicate: false, stage: 'RETURN', waybill: waybillNo, flag: flagType || '' },
+        scans: [row],
+        flags: flags,
+        ledger: ledger || []
+      };
+    }
+    if (!record) return done('ERROR', MSG.UNKNOWN_WB, 'UNKNOWN_WAYBILL', [], null);
+    if (hasReturnScan(model.scans, waybillNo) || String(record.jtStatus || '').toUpperCase() === 'RETURNED') {
+      return done('ERROR', 'Already returned. Stock was not changed.', 'RETURNED_TWICE', [], null);
+    }
+    var view = buildWaybillView(record, model.items, model.scans, null);
+    if (!view.dispatched && !view.pickedUp) {
+      return done('ERROR', 'Not dispatched or picked up. Stock was not changed.', 'RETURN_NOT_SENT', [], null);
+    }
+    var lines = event.lines || [];
+    if (!lines.length) {
+      lines = (view.lines || []).filter(function (line) { return !line.unknown; }).map(function (line) {
+        return { sku: line.sku, good: line.expected, damaged: 0, reason: 'RTS' };
+      });
+    }
+    var ledger = [];
+    var reasons = {};
+    lines.forEach(function (line) {
+      var sku = normalizeSku(line.sku);
+      if (!sku) return;
+      var good = parseInt(line.good, 10) || 0;
+      var damaged = parseInt(line.damaged, 10) || 0;
+      if (good < 0) good = 0;
+      if (damaged < 0) damaged = 0;
+      var reason = String(line.reason || 'RTS').trim() || 'RTS';
+      reasons[reason] = true;
+      if (good) ledger.push({ date: formatManila(moment), client: record.client, sku: sku, type: 'RTS', qty: good, ref: waybillNo, source: 'RETURN' });
+      if (damaged) ledger.push({ date: formatManila(moment), client: record.client, sku: sku, type: 'DAMAGED', qty: damaged, ref: waybillNo, source: 'RETURN' });
+    });
+    var reasonText = Object.keys(reasons).join(', ') || 'RTS';
+    var patch = { _row: record._row || 0, waybillNo: waybillNo, jtStatus: 'RETURNED', rtsReason: reasonText };
+    return done('OK', 'Returned. Good stock is back. Damaged is counted apart.', '', ledger, patch);
+  }
+
+  function planReceive(model, staff, event, moment) {
+    var localId = String(event.localId || '').trim();
+    var sku = normalizeSku(event.sku || event.code);
+    var qty = parseInt(event.qty, 10) || 0;
+    var client = normalizeClient(event.client);
+    var ref = String(event.ref || event.reference || '').trim();
+    function done(result, message) {
+      return {
+        applied: { localId: localId, result: result, message: message, duplicate: false, stage: 'RECEIVE', waybill: ref, flag: '' },
+        scans: [stockScan(moment, staff, 'RECEIVE', ref, sku, qty, result, message, localId)],
+        flags: [],
+        ledger: []
+      };
+    }
+    if (!canReceive(staff)) return done('ERROR', 'You cannot receive stock.');
+    if (!sku || qty < 1) return done('ERROR', 'Enter a SKU and a quantity.');
+    if (!ref) return done('ERROR', 'Enter the DR or PO number.');
+    var item = null;
+    (model.items || []).forEach(function (row) {
+      if (!isActiveItem(row)) return;
+      if (normalizeSku(row.sku) !== sku && barcodeKey(row.barcode) !== barcodeKey(event.sku || event.code)) return;
+      if (client && normalizeClient(row.client) !== client) return;
+      item = row;
+    });
+    if (!item) return done('ERROR', 'Unknown code');
+    var ledger = [{
+      date: formatManila(moment),
+      client: item.client,
+      sku: item.sku,
+      type: 'PURCHASE',
+      qty: qty,
+      ref: ref,
+      source: 'RECEIVE'
+    }];
+    var row = stockScan(moment, staff, 'RECEIVE', ref, item.sku, qty, 'OK', 'Received ' + qty + ' ' + item.sku, localId);
+    row._ledger = ledger;
+    return {
+      applied: { localId: localId, result: 'OK', message: 'Received ' + qty + ' ' + item.sku + '.', duplicate: false, stage: 'RECEIVE', waybill: ref, flag: '' },
+      scans: [row],
+      flags: [],
+      ledger: ledger
+    };
+  }
+
+  function planStockMove(model, staff, event, moment) {
+    var action = String((event && (event.action || event.stage)) || '').toUpperCase();
+    if (action === 'RETURN') return planReturn(model, staff, event, moment);
+    if (action === 'RECEIVE') return planReceive(model, staff, event, moment);
+    return null;
+  }
+
   function applyScans(model, staff, events, now, config) {
-    var moment = now || new Date();
+    var batchNow = now || new Date();
+    var moment = batchNow;
     var conf = cfg(config);
     var applied = [];
     var flags = [];
     var knownIds = scanIdSet(model.scans);
     var touched = {};
     var seenBlocks = {};
+    var seenErrors = {};
 
     (events || []).forEach(function (event) {
+      moment = batchNow;
+      if (event && event.scannedAt) {
+        var stamped = new Date(event.scannedAt);
+        if (!isNaN(stamped.getTime())) moment = stamped;
+      }
       var localId = String((event && event.localId) || '').trim();
       if (localId && knownIds[localId]) {
         var prior = knownIds[localId];
@@ -1435,6 +1716,29 @@
           flag: ''
         });
         touched[normWaybill(prior.waybill)] = true;
+        return;
+      }
+
+      var stockMove = planStockMove(model, staff, event, moment);
+      if (stockMove) {
+        (stockMove.scans || []).forEach(function (row) {
+          model.scans.push(row);
+          if (localId) knownIds[localId] = row;
+        });
+        (stockMove.ledger || []).forEach(function (row) {
+          if (!model.ledger) model.ledger = [];
+          model.ledger.push(row);
+        });
+        if (stockMove.scans[0] && stockMove.scans[0]._waybill) {
+          var patch = stockMove.scans[0]._waybill;
+          var target = findWaybill(model, patch.waybillNo);
+          if (target) {
+            target.jtStatus = patch.jtStatus;
+            target.rtsReason = patch.rtsReason;
+          }
+        }
+        (stockMove.flags || []).forEach(function (flag) { flags.push(flag); });
+        if (stockMove.applied) applied.push(stockMove.applied);
         return;
       }
 
@@ -1475,6 +1779,26 @@
         return;
       }
       if (decision.result === 'BLOCKED') seenBlocks[blockId] = true;
+      var errorReason = String(decision.details || decision.message || reason || '');
+      var errorId = blockKey(staff, decision.waybill || waybillNo, decision.stage, errorReason);
+      var errorRecent = decision.result === 'ERROR' && (
+        seenErrors[errorId] ||
+        recentScan(model.scans, 'ERROR', staff, decision.waybill || waybillNo, decision.stage, moment, errorReason)
+      );
+      if (errorRecent) {
+        applied.push({
+          localId: localId,
+          result: 'ERROR',
+          message: decision.message,
+          sku: '',
+          stage: decision.stage,
+          waybill: decision.waybill || waybillNo,
+          flag: '',
+          duplicate: true
+        });
+        return;
+      }
+      if (decision.result === 'ERROR') seenErrors[errorId] = true;
       var scan = {
         timestamp: formatManila(moment),
         staffEmail: normalizeEmail(staff && staff.email),
@@ -1484,7 +1808,7 @@
         sku: clipScanText(decision.sku || ''),
         qty: decision.qty || 0,
         result: decision.result,
-        message: withId(localId, decision.logMessage || ''),
+        message: withId(localId, decision.result === 'ERROR' ? (errorReason || decision.logMessage || '') : (decision.logMessage || '')),
         blockReason: decision.result === 'BLOCKED' ? reason : '',
         _blockMs: decision.result === 'BLOCKED' ? moment.getTime() : 0
       };
@@ -1771,9 +2095,9 @@
     return null;
   }
 
-  function mapJtNames(parts, client, items) {
+  function mapJtNames(parts, client, items, skuMap) {
     var resolved = (parts || []).map(function (part) {
-      return resolveSegment(part.name, part.qty, client, items);
+      return resolveSegment(part.name, part.qty, client, items, skuMap);
     });
     var unknown = [];
     var seen = {};
@@ -1799,6 +2123,196 @@
     });
   }
 
+  function levenshtein(a, b) {
+    var left = String(a || '');
+    var right = String(b || '');
+    if (left === right) return 0;
+    if (!left.length) return right.length;
+    if (!right.length) return left.length;
+    var prev = [];
+    var j;
+    for (j = 0; j <= right.length; j++) prev[j] = j;
+    for (var i = 1; i <= left.length; i++) {
+      var cur = [i];
+      for (j = 1; j <= right.length; j++) {
+        var cost = left.charAt(i - 1) === right.charAt(j - 1) ? 0 : 1;
+        cur[j] = Math.min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+      }
+      prev = cur;
+    }
+    return prev[right.length];
+  }
+
+  function suggestSku(token, client, items) {
+    var label = normalizeSku(token);
+    var hint = normalizeClient(client);
+    var best = '';
+    var bestDist = 0;
+    if (!label || !hint) return '';
+    (items || []).forEach(function (item) {
+      if (!isActiveItem(item) || normalizeClient(item.client) !== hint) return;
+      var candidates = [item.sku, item.productName].concat(String(item.jtAlias || '').split(','));
+      candidates.forEach(function (text) {
+        var other = normalizeSku(text);
+        if (!other) return;
+        var dist = levenshtein(label, other);
+        if (!best || dist < bestDist) {
+          best = normalizeSku(item.sku);
+          bestDist = dist;
+        }
+      });
+    });
+    return best;
+  }
+
+  function countTokenWaybills(waybills, client, token) {
+    var want = normalizeSku(token);
+    var hint = normalizeClient(client);
+    var seen = {};
+    (waybills || []).forEach(function (wb) {
+      if (normalizeClient(wb.client) !== hint) return;
+      var no = normWaybill(wb.waybillNo);
+      if (!no || seen[no]) return;
+      var hit = false;
+      String(wb.unmapped || '').split(',').forEach(function (part) {
+        if (normalizeSku(part) === want) hit = true;
+      });
+      parseItemSegments(wb.rawItems || '').concat(parseItemSegments(wb.itemString || '')).forEach(function (seg) {
+        if (normalizeSku(seg.name) === want) hit = true;
+      });
+      if (hit) seen[no] = true;
+    });
+    return Object.keys(seen).length;
+  }
+
+  function queueToMap(existing, hits, items, waybills, now) {
+    var groups = {};
+    (hits || []).forEach(function (hit) {
+      var client = normalizeClient(hit.client);
+      var token = String(hit.token || '').replace(/\s+/g, ' ').trim();
+      if (!client || !normalizeSku(token)) return;
+      var key = client + '|' + normalizeSku(token);
+      if (!groups[key]) groups[key] = { client: client, token: token, raw: String(hit.raw || '').trim() };
+      else if (!groups[key].raw && hit.raw) groups[key].raw = String(hit.raw).trim();
+    });
+    var inserts = [];
+    var updates = [];
+    Object.keys(groups).forEach(function (key) {
+      var group = groups[key];
+      var prior = null;
+      (existing || []).forEach(function (row) {
+        if (normalizeClient(row.client) === group.client && normalizeSku(row.token) === normalizeSku(group.token)) prior = row;
+      });
+      var count = countTokenWaybills(waybills, group.client, group.token);
+      if (!count) count = 1;
+      if (prior) {
+        if (String(prior.status || 'PENDING').toUpperCase() !== 'PENDING') return;
+        if (num(prior.waybillCount) === count) return;
+        updates.push({
+          _row: prior._row,
+          client: prior.client,
+          raw: prior.raw || group.raw,
+          token: prior.token || group.token,
+          suggestedSku: prior.suggestedSku || suggestSku(group.token, group.client, items),
+          waybillCount: count,
+          firstSeen: prior.firstSeen || '',
+          status: 'PENDING',
+          approvedSku: prior.approvedSku || '',
+          approvedBy: prior.approvedBy || '',
+          approvedAt: prior.approvedAt || ''
+        });
+        return;
+      }
+      inserts.push({
+        client: group.client,
+        raw: group.raw,
+        token: group.token,
+        suggestedSku: suggestSku(group.token, group.client, items),
+        waybillCount: count,
+        firstSeen: formatManila(now),
+        status: 'PENDING',
+        approvedSku: '',
+        approvedBy: '',
+        approvedAt: ''
+      });
+    });
+    return { inserts: inserts, updates: updates };
+  }
+
+  function skuMapHas(rows, client, raw, sku) {
+    return (rows || []).some(function (row) {
+      return normalizeClient(row.client) === normalizeClient(client)
+        && normalizeSku(row.raw) === normalizeSku(raw)
+        && normalizeSku(row.sku) === normalizeSku(sku);
+    });
+  }
+
+  function applyApprovedMappings(model, now, approver) {
+    var moment = now || new Date();
+    var skuMap = (model.skuMap || []).map(function (row) { return Object.assign({}, row); });
+    var added = [];
+    var toMap = [];
+    (model.toMap || []).forEach(function (row) {
+      var sku = normalizeSku(row.approvedSku);
+      if (!sku) return;
+      var client = normalizeClient(row.client);
+      var token = String(row.token || '').trim();
+      if (!client || !token) return;
+      var active = (model.items || []).some(function (item) {
+        return isActiveItem(item) && normalizeClient(item.client) === client && normalizeSku(item.sku) === sku;
+      });
+      if (!active) return;
+      if (!skuMapHas(skuMap, client, token, sku)) {
+        var entry = { raw: token, client: client, sku: sku, qty: 1 };
+        skuMap.push(entry);
+        added.push(entry);
+      }
+      toMap.push({
+        _row: row._row,
+        client: client,
+        raw: row.raw || '',
+        token: token,
+        suggestedSku: normalizeSku(row.suggestedSku),
+        waybillCount: num(row.waybillCount),
+        firstSeen: row.firstSeen || '',
+        status: 'APPROVED',
+        approvedSku: sku,
+        approvedBy: row.approvedBy || approver || '',
+        approvedAt: row.approvedAt || formatManila(moment)
+      });
+    });
+    var waybills = [];
+    (model.waybills || []).forEach(function (wb) {
+      if (!String(wb.unmapped || '').trim() && String(wb.itemString || '').indexOf('x') < 0) return;
+      var parsed = resolveLineItems(wb.rawItems || wb.itemString, wb.client, skuMap, model.items);
+      var unmapped = parsed.unknown.join(', ');
+      var itemString = parsed.itemString || wb.itemString || '';
+      if (unmapped === String(wb.unmapped || '').trim() && itemString === String(wb.itemString || '').trim()) return;
+      waybills.push({
+        _row: wb._row,
+        waybillNo: wb.waybillNo,
+        client: wb.client,
+        itemString: itemString,
+        rawItems: wb.rawItems || '',
+        unmapped: unmapped
+      });
+    });
+    var flags = [];
+    var cleared = {};
+    waybills.forEach(function (wb) {
+      if (String(wb.unmapped || '').trim()) return;
+      cleared[normWaybill(wb.waybillNo)] = true;
+    });
+    (model.flags || []).forEach(function (flag) {
+      var type = String(flag.type || '').toUpperCase();
+      if (type !== 'UNKNOWN_ITEM' && type !== 'UNMAPPED_ITEM') return;
+      if (isResolved(flag)) return;
+      if (!cleared[normWaybill(flag.waybill)]) return;
+      flags.push(Object.assign({}, flag, { resolved: true }));
+    });
+    return { skuMapAdded: added, toMap: toMap, waybills: waybills, flags: flags };
+  }
+
   /**
    * J&T My Waybill export. Keeps three creator codes, never stores personal
    * columns, and does not deduct stock. Re-import updates status fields only,
@@ -1815,6 +2329,13 @@
     var seen = {};
     var fresh = {};
     var noted = {};
+    var toMapHits = [];
+    function noteTokens(client, waybillNo, raw, segments) {
+      (segments || []).forEach(function (seg) {
+        if (!seg || !seg.unknown) return;
+        toMapHits.push({ client: client, raw: raw, token: seg.name, waybill: waybillNo });
+      });
+    }
     (model.waybills || []).forEach(function (row) {
       seen[normWaybill(row.waybillNo)] = row;
     });
@@ -1843,7 +2364,8 @@
         return;
       }
       byClient[client] += 1;
-      var parsed = mapJtNames(parseJtItemName(row.itemName), client, model.items);
+      var parsed = mapJtNames(parseJtItemName(row.itemName), client, model.items, model.skuMap);
+      noteTokens(client, row.waybillNo, row.itemName, parsed.segments);
       var existing = seen[row.waybillNo];
       if (!existing) {
         var created = {
@@ -1907,6 +2429,9 @@
 
     var unknownItems = Object.keys(unknownCounts).map(function (key) { return unknownCounts[key]; });
     unknownItems.sort(function (a, b) { return b.count - a.count || (a.name < b.name ? -1 : 1); });
+    var allWaybills = [];
+    Object.keys(seen).forEach(function (key) { allWaybills.push(seen[key]); });
+    var queued = queueToMap(model.toMap, toMapHits, model.items, allWaybills, moment);
     return {
       dropped: dropped,
       byClient: byClient,
@@ -1914,6 +2439,8 @@
       updates: updates,
       flags: flags,
       ledger: [],
+      toMap: queued.inserts,
+      toMapUpdates: queued.updates,
       unknownItems: unknownItems,
       preview: {
         dropped: dropped,
@@ -1938,6 +2465,7 @@
     var ledger = [];
     var flags = [];
     var warnings = [];
+    var toMapHits = [];
     var posted = {};
     (model.ledger || []).forEach(function (row) {
       if (String(row.type || '').toUpperCase() === 'SHIP_OUT') posted[normWaybill(row.ref)] = true;
@@ -1951,6 +2479,15 @@
         return;
       }
       var resolved = resolveLineItems(itemText, row.client, model.skuMap, model.items);
+      resolved.segments.forEach(function (seg) {
+        if (!seg.unknown) return;
+        toMapHits.push({
+          client: resolved.client || row.client,
+          raw: itemText,
+          token: seg.name,
+          waybill: waybillNo
+        });
+      });
       var pending = null;
       for (var p = 0; p < inserts.length; p++) {
         if (inserts[p].waybillNo === waybillNo) pending = inserts[p];
@@ -2051,12 +2588,27 @@
       pushFlag(flags, model.flags, flag, 'type');
     });
 
+    var waybillRows = (model.waybills || []).map(function (row) { return Object.assign({}, row); });
+    inserts.forEach(function (row) { waybillRows.push(row); });
+    updates.forEach(function (row) {
+      var replaced = false;
+      waybillRows.forEach(function (wb, index) {
+        if (normWaybill(wb.waybillNo) === normWaybill(row.waybillNo)) {
+          waybillRows[index] = Object.assign({}, wb, row);
+          replaced = true;
+        }
+      });
+      if (!replaced) waybillRows.push(row);
+    });
+    var queued = queueToMap(model.toMap, toMapHits, model.items, waybillRows, moment);
     return {
       inserts: inserts,
       updates: updates,
       ledger: ledger,
       flags: flags,
-      warnings: warnings
+      warnings: warnings,
+      toMap: queued.inserts,
+      toMapUpdates: queued.updates
     };
   }
 
@@ -2160,13 +2712,18 @@
   }
 
   function blockedWithin(scans, staff, waybill, stage, now, reason) {
+    return recentScan(scans, 'BLOCKED', staff, waybill, stage, now, reason);
+  }
+
+  function recentScan(scans, result, staff, waybill, stage, now, reason) {
     var email = normalizeEmail(staff && staff.email);
     var want = normWaybill(waybill);
     var stageName = String(stage || '').toUpperCase();
     var why = String(reason || '').toUpperCase();
+    var wantResult = String(result || '').toUpperCase();
     var moment = (now || new Date()).getTime();
     return (scans || []).some(function (scan) {
-      if (String(scan.result || '').toUpperCase() !== 'BLOCKED') return false;
+      if (String(scan.result || '').trim().toUpperCase() !== wantResult) return false;
       if (normalizeEmail(scan.staffEmail) !== email) return false;
       if (normWaybill(scan.waybill) !== want) return false;
       if (String(scan.stage || '').toUpperCase() !== stageName) return false;
@@ -2320,12 +2877,35 @@
     views.forEach(function (view) {
       if (view.pickedUp && isToday(view.pickupTime)) counts.PICKUP += 1;
     });
+    var returnedToday = {};
+    var receivesToday = 0;
+    var damagedToday = 0;
+    (model.scans || []).forEach(function (scan) {
+      if (String(scan.result || '').trim().toUpperCase() !== 'OK') return;
+      if (!isToday(scan.timestamp)) return;
+      var stage = String(scan.stage || '').toUpperCase();
+      if (stage === 'RETURN') returnedToday[normWaybill(scan.waybill)] = true;
+      if (stage === 'RECEIVE') receivesToday += 1;
+    });
+    (model.ledger || []).forEach(function (row) {
+      if (String(row.type || '').toUpperCase() !== 'DAMAGED') return;
+      if (!isToday(row.date)) return;
+      damagedToday += num(row.qty);
+    });
+    counts.RETURN = Object.keys(returnedToday).length;
+    counts.RECEIVE = receivesToday;
+    counts.DAMAGED = damagedToday;
+    var forReturn = [];
+    (model.waybills || []).forEach(function (waybill) {
+      if (needsReturnScan(waybill, model.scans)) forReturn.push(clipDisplay(waybill.waybillNo));
+    });
 
     var buckets = {
       printedNotPicked: [],
       pickedNotPacked: [],
       packedNotDispatched: [],
-      dispatchedNotPickedUp: []
+      dispatchedNotPickedUp: [],
+      forReturn: forReturn
     };
     views.forEach(function (view) {
       var shown = clipDisplay(view.waybillNo);
@@ -2348,9 +2928,7 @@
       byStaff[name].units += num(scan.qty);
     });
 
-    var flags = (model.flags || []).filter(function (flag) {
-      return !isResolved(flag);
-    }).map(function (flag) {
+    function flagCard(flag, resolved) {
       return {
         timestamp: clipDisplay(asManilaString(flag.timestamp)),
         waybill: clipDisplay(normWaybill(flag.waybill)),
@@ -2360,10 +2938,20 @@
         clientLabel: clipDisplay(clientLabel(flag.client)),
         type: clipDisplay(String(flag.type || '').toUpperCase()),
         details: clipDisplay(flag.details || ''),
-        staff: clipDisplay(flag.staff || '')
+        staff: clipDisplay(flag.staff || ''),
+        resolved: !!resolved
       };
+    }
+    var raised = planAutoFlags(model, conf, moment);
+    var flags = (model.flags || []).filter(function (flag) {
+      return !isResolved(flag);
+    }).concat(raised).map(function (flag) {
+      return flagCard(flag, false);
     }).sort(function (a, b) {
       return a.timestamp < b.timestamp ? 1 : -1;
+    });
+    var resolvedFlags = (model.flags || []).filter(isResolved).slice(0, 30).map(function (flag) {
+      return flagCard(flag, true);
     });
 
     return {
@@ -2371,7 +2959,22 @@
       counts: counts,
       backlog: buckets,
       flags: flags,
+      resolvedFlags: resolvedFlags,
       partial: false,
+      pendingMaps: (model.toMap || []).filter(function (row) {
+        return String(row.status || '').toUpperCase() === 'PENDING';
+      }).map(function (row) {
+        return {
+          client: row.client,
+          token: row.token,
+          raw: clipDisplay(row.raw || ''),
+          suggestedSku: row.suggestedSku || '',
+          waybillCount: num(row.waybillCount),
+          skus: (model.items || []).filter(function (item) {
+            return isActiveItem(item) && normalizeClient(item.client) === normalizeClient(row.client);
+          }).map(function (item) { return item.sku; })
+        };
+      }),
       stageOwners: stageOwnerRows(model.scans, (function () {
         var done = {};
         views.forEach(function (view) {
@@ -2395,6 +2998,7 @@
     var sum = (ledgerRows || []).reduce(function (total, row) {
       if (normalizeSku(row.sku) !== wantSku) return total;
       if (wantClient && normalizeClient(row.client) !== wantClient) return total;
+      if (String(row.type || '').toUpperCase() === 'DAMAGED') return total;
       return total + num(row.qty);
     }, 0);
     return num(beginningQty) + sum;
@@ -2409,16 +3013,18 @@
         client: '=IFERROR(INDEX(ITEMS!B:B,' + pick + '),"")',
         name: '=IFERROR(INDEX(ITEMS!C:C,' + pick + '),"")',
         beginning: '=IFERROR(INDEX(ITEMS!E:E,' + pick + '),0)',
-        ledger: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ')',
-        onHand: '=D' + row + '+E' + row
+        ledger: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ')-SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ',LEDGER!D:D,"DAMAGED")',
+        onHand: '=D' + row + '+E' + row,
+        damaged: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ',LEDGER!D:D,"DAMAGED")'
       };
     }
     return {
       client: '=IFERROR(INDEX(ITEMS!B:B,MATCH(A' + row + ',ITEMS!A:A,0)),"")',
       name: '=IFERROR(INDEX(ITEMS!C:C,MATCH(A' + row + ',ITEMS!A:A,0)),"")',
       beginning: '=IFERROR(INDEX(ITEMS!E:E,MATCH(A' + row + ',ITEMS!A:A,0)),0)',
-      ledger: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ')',
-      onHand: '=D' + row + '+E' + row
+      ledger: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ')-SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ',LEDGER!D:D,"DAMAGED")',
+      onHand: '=D' + row + '+E' + row,
+      damaged: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ',LEDGER!D:D,"DAMAGED")'
     };
   }
 
@@ -2551,10 +3157,11 @@
     return {
       items: model.items,
       skuMap: model.skuMap,
-      waybills: model.waybills,
+      waybills: (model.waybills || []).map(function (row) { return Object.assign({}, row); }),
+      settings: model.settings,
       scans: (model.scans || []).slice(),
       flags: (model.flags || []).slice(),
-      ledger: model.ledger || [],
+      ledger: (model.ledger || []).slice(),
       staff: model.staff
     };
   }
@@ -2609,10 +3216,12 @@
     if (item.flagRow && !(existingFlags || []).some(function (row) { return sameFlagRow(row, item.flagRow); })) {
       flags = [item.flagRow];
     }
+    var ledger = (item.scanRow && item.scanRow._ledger) || [];
+    var waybill = (item.scanRow && item.scanRow._waybill) || null;
     if (item.phase === 'scans-sent' || sheetHasScan) {
-      return { scans: [], flags: flags, phase: 'done' };
+      return { scans: [], flags: flags, ledger: [], waybill: null, phase: 'done' };
     }
-    return { scans: item.scanRow ? [item.scanRow] : [], flags: [], phase: 'scans-sent' };
+    return { scans: item.scanRow ? [item.scanRow] : [], flags: [], ledger: ledger, waybill: waybill, phase: 'scans-sent' };
   }
 
   function attachSyncRows(model, staff, queue, now, config) {
@@ -2644,10 +3253,10 @@
 
   function pendingLabel(count, online, syncing) {
     if (syncing) return 'Syncing…';
+    if (!online) return 'Offline';
     var n = count || 0;
     if (n === 1) return '1 to sync';
     if (n > 1) return n + ' to sync';
-    if (!online) return 'Offline';
     return 'Saved';
   }
 
@@ -2677,6 +3286,32 @@
       record.ref || '',
       record.source || ''
     ];
+  }
+
+  function toMapToRow(record) {
+    return [
+      record.client || '',
+      record.raw || '',
+      record.token || '',
+      record.suggestedSku || '',
+      num(record.waybillCount),
+      record.firstSeen || '',
+      record.status || 'PENDING',
+      record.approvedSku || '',
+      record.approvedBy || '',
+      record.approvedAt || ''
+    ];
+  }
+
+  function writeToMapPlan(ss, plan) {
+    var sheet = ss.getSheetByName(SHEETS.TO_MAP.name);
+    if (!sheet) return 0;
+    (plan.toMapUpdates || []).forEach(function (row) {
+      if (!row._row) return;
+      sheet.getRange(row._row, 1, 1, SHEETS.TO_MAP.headers.length).setValues([toMapToRow(row)]);
+    });
+    appendMatrix(sheet, (plan.toMap || []).map(toMapToRow));
+    return (plan.toMap || []).length;
   }
 
   function flagToRow(record) {
@@ -2711,10 +3346,12 @@
     });
     var waybillStart = appendMatrix(sheet, (plan.inserts || []).map(waybillToRow));
     var flagStart = appendMatrix(ss.getSheetByName(SHEETS.FLAGS.name), (plan.flags || []).map(flagToRow));
+    writeToMapPlan(ss, plan);
     return {
       inserted: (plan.inserts || []).length,
       updated: (plan.updates || []).length,
       flags: (plan.flags || []).length,
+      toMap: (plan.toMap || []).length,
       waybillStart: waybillStart,
       flagStart: flagStart
     };
@@ -2729,11 +3366,13 @@
     var waybillStart = appendMatrix(waybillSheet, (plan.inserts || []).map(waybillToRow));
     var ledgerStart = appendMatrix(ss.getSheetByName(SHEETS.LEDGER.name), (plan.ledger || []).map(ledgerToRow));
     var flagStart = appendMatrix(ss.getSheetByName(SHEETS.FLAGS.name), (plan.flags || []).map(flagToRow));
+    writeToMapPlan(ss, plan);
     return {
       inserted: (plan.inserts || []).length,
       updated: (plan.updates || []).length,
       ledgerRows: (plan.ledger || []).length,
       flags: (plan.flags || []).length,
+      toMap: (plan.toMap || []).length,
       warnings: plan.warnings || [],
       waybillStart: waybillStart,
       ledgerStart: ledgerStart,
@@ -2774,12 +3413,13 @@
           formulas.ledger,
           formulas.onHand
         ]]);
+        if (formulas.damaged) sheet.getRange(have[n], 7).setValue(formulas.damaged);
         rewritten += 1;
       }
       for (; n < needed[sku]; n++) {
         var row = start + matrix.length;
         var added = stockFormulasForRow(row, n + 1);
-        matrix.push([sku, added.client, added.name, added.beginning, added.ledger, added.onHand]);
+        matrix.push([sku, added.client, added.name, added.beginning, added.ledger, added.onHand, added.damaged || '']);
       }
     });
     appendMatrix(sheet, matrix);
@@ -2938,7 +3578,8 @@
           active: isTruthy(row.active),
           pick: row.pick,
           pack: row.pack,
-          dispatch: row.dispatch
+          dispatch: row.dispatch,
+          receive: row.receive
         };
       }).filter(function (row) { return row.email; }),
       settings: settingsFromRows(raw.settings),
@@ -2959,9 +3600,25 @@
           _row: row._row,
           raw: String(row.raw || '').trim(),
           client: normalizeClient(row.client),
-          sku: normalizeSku(row.sku)
+          sku: normalizeSku(row.sku),
+          qty: mapMultiplier(row.qty)
         };
       }),
+      toMap: (raw.toMap || []).map(function (row) {
+        return {
+          _row: row._row,
+          client: normalizeClient(row.client),
+          raw: String(row.raw || '').trim(),
+          token: String(row.token || '').trim(),
+          suggestedSku: normalizeSku(row.suggestedSku),
+          waybillCount: num(row.waybillCount),
+          firstSeen: asManilaString(row.firstSeen),
+          status: String(row.status || 'PENDING').trim().toUpperCase() || 'PENDING',
+          approvedSku: normalizeSku(row.approvedSku),
+          approvedBy: String(row.approvedBy || '').trim(),
+          approvedAt: asManilaString(row.approvedAt)
+        };
+      }).filter(function (row) { return row.client && row.token; }),
       waybills: (raw.waybills || []).map(function (row) {
         return {
           _row: row._row,
@@ -3033,7 +3690,8 @@
           active: isTruthy(rows[i].active),
           pick: rows[i].pick,
           pack: rows[i].pack,
-          dispatch: rows[i].dispatch
+          dispatch: rows[i].dispatch,
+          receive: rows[i].receive
         };
       }
     }
@@ -3289,6 +3947,14 @@
     cellHasContent: cellHasContent,
     stageOwnerRows: stageOwnerRows,
     flagItemKey: flagItemKey,
+    barcodeKey: barcodeKey,
+    assignMissingBarcodes: assignMissingBarcodes,
+    saveBarcode: saveBarcode,
+    canReceive: canReceive,
+    needsReturnScan: needsReturnScan,
+    alreadyReturned: alreadyReturned,
+    itemsNeedingLabels: itemsNeedingLabels,
+    planStockMove: planStockMove,
     labelBarcodeValue: labelBarcodeValue,
     labelKey: labelKey,
     labelCaption: labelCaption,
@@ -3321,6 +3987,9 @@
     mapImportHeaders: mapImportHeaders,
     rowToImport: rowToImport,
     rowsFromImportSheet: rowsFromImportSheet,
+    suggestSku: suggestSku,
+    queueToMap: queueToMap,
+    applyApprovedMappings: applyApprovedMappings,
     planJtImport: planJtImport,
     planJtExport: planJtExport,
     parseJtItemName: parseJtItemName,
