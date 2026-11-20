@@ -29,8 +29,8 @@
   var SHEETS = {
     STAFF: {
       name: 'STAFF',
-      headers: ['Email', 'Name', 'Role', 'Active', 'Pick', 'Pack', 'Dispatch'],
-      fields: ['email', 'name', 'role', 'active', 'pick', 'pack', 'dispatch']
+      headers: ['Email', 'Name', 'Role', 'Active', 'Pick', 'Pack', 'Dispatch', 'Receive access'],
+      fields: ['email', 'name', 'role', 'active', 'pick', 'pack', 'dispatch', 'receive']
     },
     ITEMS: {
       name: 'ITEMS',
@@ -69,8 +69,8 @@
     },
     STOCK: {
       name: 'STOCK',
-      headers: ['SKU', 'Client', 'Product Name', 'Beginning', 'Ledger Qty', 'On Hand'],
-      fields: ['sku', 'client', 'productName', 'beginning', 'ledgerQty', 'onHand']
+      headers: ['SKU', 'Client', 'Product Name', 'Beginning', 'Ledger Qty', 'On Hand', 'Damaged'],
+      fields: ['sku', 'client', 'productName', 'beginning', 'ledgerQty', 'onHand', 'damaged']
     },
     IMPORT: {
       name: 'IMPORT',
@@ -903,6 +903,67 @@
     return { ok: true, text: text, message: '' };
   }
 
+  function barcodeKey(value) {
+    return String(value == null ? '' : value).trim().toUpperCase().replace(/\s+/g, '');
+  }
+
+  function code128Safe(text) {
+    return String(text || '').toUpperCase().replace(/[^A-Z0-9\-]/g, '');
+  }
+
+  function internalBarcode(sku, used) {
+    var base = 'VS' + code128Safe(sku);
+    if (base === 'VS') base = 'VSITEM';
+    if (base.length > 40) base = base.slice(0, 40);
+    var code = base;
+    var n = 2;
+    while (used[code]) {
+      var suffix = '-' + n;
+      code = (base + suffix).slice(0, 48);
+      if (code.length < base.length + suffix.length) code = base.slice(0, 48 - suffix.length) + suffix;
+      n += 1;
+      if (n > 9999) break;
+    }
+    return code;
+  }
+
+  function assignMissingBarcodes(items) {
+    var used = {};
+    (items || []).forEach(function (item) {
+      var code = barcodeKey(item.barcode);
+      if (code) used[code] = true;
+    });
+    var updates = [];
+    (items || []).forEach(function (item) {
+      if (barcodeKey(item.barcode)) return;
+      var code = internalBarcode(item.sku, used);
+      used[code] = true;
+      updates.push({
+        _row: item._row,
+        sku: normalizeSku(item.sku),
+        client: normalizeClient(item.client),
+        barcode: code
+      });
+    });
+    return updates;
+  }
+
+  function saveBarcode(items, sku, client, barcode) {
+    var code = barcodeKey(barcode);
+    if (!code) return { ok: false, message: 'Enter a barcode.' };
+    if (code128Symbols(code) == null && code128Symbols({ sku: 'X', barcode: code }) == null) {
+      return { ok: false, message: 'Use letters, numbers, and normal symbols only.' };
+    }
+    var owner = null;
+    (items || []).forEach(function (item) {
+      if (barcodeKey(item.barcode) !== code) return;
+      if (normalizeSku(item.sku) === normalizeSku(sku) && normalizeClient(item.client) === normalizeClient(client)) return;
+      owner = item;
+    });
+    if (owner) return { ok: false, message: 'That barcode is already used by ' + owner.sku + '.' };
+    return { ok: true, barcode: code };
+  }
+
   function labelBarcodeValue(itemOrSku, barcode) {
     var sku = '';
     var code = barcode;
@@ -1468,6 +1529,148 @@
    * The same localId is ignored on retry so a flaky phone cannot double-count.
    * Ledger is never touched here.
    */
+  function canReceive(staff) {
+    if (!staff || staff.active === false || staff.active === 0) return false;
+    if (staff.active != null && staff.active !== '' && !isTruthy(staff.active) && String(staff.role || '').toUpperCase() !== 'ADMIN') return false;
+    if (String(staff.role || '').toUpperCase() === 'ADMIN') return true;
+    return isTruthy(staff.receive);
+  }
+
+  function hasReturnScan(scans, waybillNo) {
+    var want = normWaybill(waybillNo);
+    return (scans || []).some(function (scan) {
+      return normWaybill(scan.waybill) === want
+        && String(scan.stage || '').toUpperCase() === 'RETURN'
+        && String(scan.result || '').trim().toUpperCase() === 'OK';
+    });
+  }
+
+  function statusBackForScan(status) {
+    var text = String(status || '').trim().toLowerCase();
+    if (!text || text.indexOf('returning') === 0) return false;
+    return text === 'rts' || text.indexOf('returned') === 0 || text.indexOf('rts') === 0;
+  }
+
+  function needsReturnScan(waybill, scans) {
+    if (!waybill || !statusBackForScan(waybill.jtStatus)) return false;
+    return !hasReturnScan(scans, waybill.waybillNo);
+  }
+
+  function stockScan(moment, staff, stage, waybill, sku, qty, result, message, localId) {
+    return {
+      timestamp: formatManila(moment),
+      staffEmail: normalizeEmail(staff && staff.email),
+      staffName: (staff && staff.name) || '',
+      stage: stage,
+      waybill: normWaybill(waybill),
+      sku: normalizeSku(sku),
+      qty: qty || 0,
+      result: result,
+      message: withId(localId, message)
+    };
+  }
+
+  function planReturn(model, staff, event, moment) {
+    var waybillNo = normWaybill(event.waybill || event.code);
+    var localId = String(event.localId || '').trim();
+    var record = findWaybill(model, waybillNo);
+    function done(result, message, flagType, ledger, patch) {
+      var row = stockScan(moment, staff, 'RETURN', waybillNo, '', 0, result, message, localId);
+      if (ledger && ledger.length) row._ledger = ledger;
+      if (patch) row._waybill = patch;
+      var flags = [];
+      if (flagType) flags.push(makeFlag(moment, waybillNo, record ? record.client : '', flagType, message, staff));
+      return {
+        applied: { localId: localId, result: result, message: message, duplicate: false, stage: 'RETURN', waybill: waybillNo, flag: flagType || '' },
+        scans: [row],
+        flags: flags,
+        ledger: ledger || []
+      };
+    }
+    if (!record) return done('ERROR', MSG.UNKNOWN_WB, 'UNKNOWN_WAYBILL', [], null);
+    if (hasReturnScan(model.scans, waybillNo) || String(record.jtStatus || '').toUpperCase() === 'RETURNED') {
+      return done('ERROR', 'Already returned. Stock was not changed.', 'RETURNED_TWICE', [], null);
+    }
+    var view = buildWaybillView(record, model.items, model.scans, null);
+    if (!view.dispatched && !view.pickedUp) {
+      return done('ERROR', 'Not dispatched or picked up. Stock was not changed.', 'RETURN_NOT_SENT', [], null);
+    }
+    var lines = event.lines || [];
+    if (!lines.length) {
+      lines = (view.lines || []).filter(function (line) { return !line.unknown; }).map(function (line) {
+        return { sku: line.sku, good: line.expected, damaged: 0, reason: 'RTS' };
+      });
+    }
+    var ledger = [];
+    var reasons = {};
+    lines.forEach(function (line) {
+      var sku = normalizeSku(line.sku);
+      if (!sku) return;
+      var good = parseInt(line.good, 10) || 0;
+      var damaged = parseInt(line.damaged, 10) || 0;
+      if (good < 0) good = 0;
+      if (damaged < 0) damaged = 0;
+      var reason = String(line.reason || 'RTS').trim() || 'RTS';
+      reasons[reason] = true;
+      if (good) ledger.push({ date: formatManila(moment), client: record.client, sku: sku, type: 'RTS', qty: good, ref: waybillNo, source: 'RETURN' });
+      if (damaged) ledger.push({ date: formatManila(moment), client: record.client, sku: sku, type: 'DAMAGED', qty: damaged, ref: waybillNo, source: 'RETURN' });
+    });
+    var reasonText = Object.keys(reasons).join(', ') || 'RTS';
+    var patch = { _row: record._row || 0, waybillNo: waybillNo, jtStatus: 'RETURNED', rtsReason: reasonText };
+    return done('OK', 'Returned. Good stock is back. Damaged is counted apart.', '', ledger, patch);
+  }
+
+  function planReceive(model, staff, event, moment) {
+    var localId = String(event.localId || '').trim();
+    var sku = normalizeSku(event.sku || event.code);
+    var qty = parseInt(event.qty, 10) || 0;
+    var client = normalizeClient(event.client);
+    var ref = String(event.ref || event.reference || '').trim();
+    function done(result, message) {
+      return {
+        applied: { localId: localId, result: result, message: message, duplicate: false, stage: 'RECEIVE', waybill: ref, flag: '' },
+        scans: [stockScan(moment, staff, 'RECEIVE', ref, sku, qty, result, message, localId)],
+        flags: [],
+        ledger: []
+      };
+    }
+    if (!canReceive(staff)) return done('ERROR', 'You cannot receive stock.');
+    if (!sku || qty < 1) return done('ERROR', 'Enter a SKU and a quantity.');
+    if (!ref) return done('ERROR', 'Enter the DR or PO number.');
+    var item = null;
+    (model.items || []).forEach(function (row) {
+      if (!isActiveItem(row)) return;
+      if (normalizeSku(row.sku) !== sku && barcodeKey(row.barcode) !== barcodeKey(event.sku || event.code)) return;
+      if (client && normalizeClient(row.client) !== client) return;
+      item = row;
+    });
+    if (!item) return done('ERROR', 'Unknown code');
+    var ledger = [{
+      date: formatManila(moment),
+      client: item.client,
+      sku: item.sku,
+      type: 'PURCHASE',
+      qty: qty,
+      ref: ref,
+      source: 'RECEIVE'
+    }];
+    var row = stockScan(moment, staff, 'RECEIVE', ref, item.sku, qty, 'OK', 'Received ' + qty + ' ' + item.sku, localId);
+    row._ledger = ledger;
+    return {
+      applied: { localId: localId, result: 'OK', message: 'Received ' + qty + ' ' + item.sku + '.', duplicate: false, stage: 'RECEIVE', waybill: ref, flag: '' },
+      scans: [row],
+      flags: [],
+      ledger: ledger
+    };
+  }
+
+  function planStockMove(model, staff, event, moment) {
+    var action = String((event && (event.action || event.stage)) || '').toUpperCase();
+    if (action === 'RETURN') return planReturn(model, staff, event, moment);
+    if (action === 'RECEIVE') return planReceive(model, staff, event, moment);
+    return null;
+  }
+
   function applyScans(model, staff, events, now, config) {
     var batchNow = now || new Date();
     var moment = batchNow;
@@ -1497,6 +1700,29 @@
           flag: ''
         });
         touched[normWaybill(prior.waybill)] = true;
+        return;
+      }
+
+      var stockMove = planStockMove(model, staff, event, moment);
+      if (stockMove) {
+        (stockMove.scans || []).forEach(function (row) {
+          model.scans.push(row);
+          if (localId) knownIds[localId] = row;
+        });
+        (stockMove.ledger || []).forEach(function (row) {
+          if (!model.ledger) model.ledger = [];
+          model.ledger.push(row);
+        });
+        if (stockMove.scans[0] && stockMove.scans[0]._waybill) {
+          var patch = stockMove.scans[0]._waybill;
+          var target = findWaybill(model, patch.waybillNo);
+          if (target) {
+            target.jtStatus = patch.jtStatus;
+            target.rtsReason = patch.rtsReason;
+          }
+        }
+        (stockMove.flags || []).forEach(function (flag) { flags.push(flag); });
+        if (stockMove.applied) applied.push(stockMove.applied);
         return;
       }
 
@@ -2635,12 +2861,35 @@
     views.forEach(function (view) {
       if (view.pickedUp && isToday(view.pickupTime)) counts.PICKUP += 1;
     });
+    var returnedToday = {};
+    var receivesToday = 0;
+    var damagedToday = 0;
+    (model.scans || []).forEach(function (scan) {
+      if (String(scan.result || '').trim().toUpperCase() !== 'OK') return;
+      if (!isToday(scan.timestamp)) return;
+      var stage = String(scan.stage || '').toUpperCase();
+      if (stage === 'RETURN') returnedToday[normWaybill(scan.waybill)] = true;
+      if (stage === 'RECEIVE') receivesToday += 1;
+    });
+    (model.ledger || []).forEach(function (row) {
+      if (String(row.type || '').toUpperCase() !== 'DAMAGED') return;
+      if (!isToday(row.date)) return;
+      damagedToday += num(row.qty);
+    });
+    counts.RETURN = Object.keys(returnedToday).length;
+    counts.RECEIVE = receivesToday;
+    counts.DAMAGED = damagedToday;
+    var forReturn = [];
+    (model.waybills || []).forEach(function (waybill) {
+      if (needsReturnScan(waybill, model.scans)) forReturn.push(clipDisplay(waybill.waybillNo));
+    });
 
     var buckets = {
       printedNotPicked: [],
       pickedNotPacked: [],
       packedNotDispatched: [],
-      dispatchedNotPickedUp: []
+      dispatchedNotPickedUp: [],
+      forReturn: forReturn
     };
     views.forEach(function (view) {
       var shown = clipDisplay(view.waybillNo);
@@ -2733,6 +2982,7 @@
     var sum = (ledgerRows || []).reduce(function (total, row) {
       if (normalizeSku(row.sku) !== wantSku) return total;
       if (wantClient && normalizeClient(row.client) !== wantClient) return total;
+      if (String(row.type || '').toUpperCase() === 'DAMAGED') return total;
       return total + num(row.qty);
     }, 0);
     return num(beginningQty) + sum;
@@ -2747,16 +2997,18 @@
         client: '=IFERROR(INDEX(ITEMS!B:B,' + pick + '),"")',
         name: '=IFERROR(INDEX(ITEMS!C:C,' + pick + '),"")',
         beginning: '=IFERROR(INDEX(ITEMS!E:E,' + pick + '),0)',
-        ledger: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ')',
-        onHand: '=D' + row + '+E' + row
+        ledger: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ')-SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ',LEDGER!D:D,"DAMAGED")',
+        onHand: '=D' + row + '+E' + row,
+        damaged: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ',LEDGER!D:D,"DAMAGED")'
       };
     }
     return {
       client: '=IFERROR(INDEX(ITEMS!B:B,MATCH(A' + row + ',ITEMS!A:A,0)),"")',
       name: '=IFERROR(INDEX(ITEMS!C:C,MATCH(A' + row + ',ITEMS!A:A,0)),"")',
       beginning: '=IFERROR(INDEX(ITEMS!E:E,MATCH(A' + row + ',ITEMS!A:A,0)),0)',
-      ledger: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ')',
-      onHand: '=D' + row + '+E' + row
+      ledger: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ')-SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ',LEDGER!D:D,"DAMAGED")',
+      onHand: '=D' + row + '+E' + row,
+      damaged: '=SUMIFS(LEDGER!E:E,LEDGER!C:C,A' + row + ',LEDGER!B:B,B' + row + ',LEDGER!D:D,"DAMAGED")'
     };
   }
 
@@ -2889,10 +3141,10 @@
     return {
       items: model.items,
       skuMap: model.skuMap,
-      waybills: model.waybills,
+      waybills: (model.waybills || []).map(function (row) { return Object.assign({}, row); }),
       scans: (model.scans || []).slice(),
       flags: (model.flags || []).slice(),
-      ledger: model.ledger || [],
+      ledger: (model.ledger || []).slice(),
       staff: model.staff
     };
   }
@@ -2947,10 +3199,12 @@
     if (item.flagRow && !(existingFlags || []).some(function (row) { return sameFlagRow(row, item.flagRow); })) {
       flags = [item.flagRow];
     }
+    var ledger = (item.scanRow && item.scanRow._ledger) || [];
+    var waybill = (item.scanRow && item.scanRow._waybill) || null;
     if (item.phase === 'scans-sent' || sheetHasScan) {
-      return { scans: [], flags: flags, phase: 'done' };
+      return { scans: [], flags: flags, ledger: [], waybill: null, phase: 'done' };
     }
-    return { scans: item.scanRow ? [item.scanRow] : [], flags: [], phase: 'scans-sent' };
+    return { scans: item.scanRow ? [item.scanRow] : [], flags: [], ledger: ledger, waybill: waybill, phase: 'scans-sent' };
   }
 
   function attachSyncRows(model, staff, queue, now, config) {
@@ -3142,12 +3396,13 @@
           formulas.ledger,
           formulas.onHand
         ]]);
+        if (formulas.damaged) sheet.getRange(have[n], 7).setValue(formulas.damaged);
         rewritten += 1;
       }
       for (; n < needed[sku]; n++) {
         var row = start + matrix.length;
         var added = stockFormulasForRow(row, n + 1);
-        matrix.push([sku, added.client, added.name, added.beginning, added.ledger, added.onHand]);
+        matrix.push([sku, added.client, added.name, added.beginning, added.ledger, added.onHand, added.damaged || '']);
       }
     });
     appendMatrix(sheet, matrix);
@@ -3306,7 +3561,8 @@
           active: isTruthy(row.active),
           pick: row.pick,
           pack: row.pack,
-          dispatch: row.dispatch
+          dispatch: row.dispatch,
+          receive: row.receive
         };
       }).filter(function (row) { return row.email; }),
       settings: settingsFromRows(raw.settings),
@@ -3417,7 +3673,8 @@
           active: isTruthy(rows[i].active),
           pick: rows[i].pick,
           pack: rows[i].pack,
-          dispatch: rows[i].dispatch
+          dispatch: rows[i].dispatch,
+          receive: rows[i].receive
         };
       }
     }
@@ -3673,6 +3930,12 @@
     cellHasContent: cellHasContent,
     stageOwnerRows: stageOwnerRows,
     flagItemKey: flagItemKey,
+    barcodeKey: barcodeKey,
+    assignMissingBarcodes: assignMissingBarcodes,
+    saveBarcode: saveBarcode,
+    canReceive: canReceive,
+    needsReturnScan: needsReturnScan,
+    planStockMove: planStockMove,
     labelBarcodeValue: labelBarcodeValue,
     labelKey: labelKey,
     labelCaption: labelCaption,

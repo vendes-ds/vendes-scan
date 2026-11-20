@@ -282,8 +282,20 @@
             var flags = L.syncWrites(item, true, S.model.flags);
             return appendRows('FLAGS', flags.flags).then(function () {
               if (flags.flags.length) S.model.flags = S.model.flags.concat(flags.flags);
-              item.phase = 'done';
-              saveQueue();
+              return appendRows('LEDGER', step.ledger || []);
+            }).then(function () {
+              if (step.ledger && step.ledger.length) S.model.ledger = (S.model.ledger || []).concat(step.ledger);
+              if (!step.waybill || !step.waybill._row) {
+                item.phase = 'done';
+                saveQueue();
+                return;
+              }
+              return writeValues('WAYBILLS!F' + step.waybill._row, [[step.waybill.jtStatus || '']]).then(function () {
+                return writeValues('WAYBILLS!J' + step.waybill._row, [[step.waybill.rtsReason || '']]);
+              }).then(function () {
+                item.phase = 'done';
+                saveQueue();
+              });
             });
           });
         });
@@ -426,6 +438,8 @@
       stageButton('pick', 'PICK', 'Collect the items') +
       stageButton('pack', 'PACK', 'Put the items in the parcel') +
       stageButton('dispatch', 'DISPATCH', 'Hand the parcel to the rider') +
+      '<button type="button" class="big dispatch" data-go="return"><span class="mark">R</span><span class="stage-copy"><b>RETURN</b><span>Good stock back, damaged counted apart</span></span></button>' +
+      (L.canReceive(S.staff) ? '<button type="button" class="big pack" data-go="receive"><span class="mark">+</span><span class="stage-copy"><b>RECEIVE</b><span>DR or PO into stock</span></span></button>' : '') +
       admin +
       '<p class="note">Scan only. Stock drops when the J&amp;T rider picks the parcel up.</p></main>';
   }
@@ -495,7 +509,8 @@
       ['printedNotPicked', 'Printed, not picked yet'],
       ['pickedNotPacked', 'Picked, not packed yet'],
       ['packedNotDispatched', 'Packed, not dispatched yet'],
-      ['dispatchedNotPickedUp', 'Dispatched, no J&T pickup']
+      ['dispatchedNotPickedUp', 'Dispatched, no J&T pickup'],
+      ['forReturn', 'For return scan']
     ];
     var backlog = buckets.map(function (pair) {
       var list = (S.dash.backlog && S.dash.backlog[pair[0]]) || [];
@@ -517,6 +532,7 @@
       '<h2>Today · ' + esc(L.clipDisplay(S.dash.today)) + '</h2>' +
       '<p class="hint" title="A count is waybills that finished that stage today. A shortage is shown beside the count, not inside it.">Waybills that finished the stage today. Shortages are counted apart.</p>' +
       '<div class="tiles">' + tiles + '</div>' +
+      '<p class="note">Returns today ' + (counts.RETURN || 0) + ' · Receives today ' + (counts.RECEIVE || 0) + ' · Damaged ' + (counts.DAMAGED || 0) + '</p>' +
       mapQueueHtml() +
       '<h2>Open flags</h2>' +
       '<button type="button" class="ghost" data-action="toggle-resolved">' + (S.showResolved ? 'Hide resolved' : 'Show resolved') + '</button>' +
@@ -525,6 +541,11 @@
       '<h2>Who did each stage</h2>' + ownersHtml() +
       '<p class="note">J&amp;T import still runs from the Google Sheet menu. Stock changes only there.</p>' +
       '<button type="button" class="wide" data-go="jt">Import J&T export</button>' +
+      '<h2>Barcodes</h2>' +
+      '<button type="button" class="wide" data-action="assign-barcodes">Assign missing barcodes</button>' +
+      '<form id="barcode-form"><input id="barcode-sku" placeholder="SKU to edit">' +
+      '<input id="barcode-value" placeholder="New barcode">' +
+      '<button type="submit">Save barcode</button></form>' +
       '<button type="button" class="wide" data-go="labels">Print SKU labels</button></main>';
   }
 
@@ -807,6 +828,8 @@
     else if (S.screen === 'admin') app.innerHTML = adminHtml();
     else if (S.screen === 'labels') app.innerHTML = labelsHtml();
     else if (S.screen === 'jt') app.innerHTML = jtHtml();
+    else if (S.screen === 'return') app.innerHTML = returnHtml();
+    else if (S.screen === 'receive') app.innerHTML = receiveHtml();
     else app.innerHTML = stageHtml();
     var input = $('code-input');
     armBanner();
@@ -912,6 +935,153 @@
     };
   }
 
+  function returnHtml() {
+    var view = S.returnWaybill && S.payload && S.payload.waybills[S.returnWaybill];
+    var lines = '';
+    if (view) {
+      lines = (view.lines || []).filter(function (line) { return !line.unknown; }).map(function (line, index) {
+        return '<div class="card"><b>' + esc(line.sku) + '</b><p class="hint">' + esc(line.name) + ' · expected ' + line.expected + '</p>' +
+          '<label>Good <input type="number" min="0" data-good="' + index + '" value="' + line.expected + '"></label>' +
+          '<label>Damaged <input type="number" min="0" data-damaged="' + index + '" value="0"></label>' +
+          '<select data-reason="' + index + '"><option>RTS</option><option>Cancelled</option><option>Refused</option><option>Other</option></select></div>';
+      }).join('');
+    }
+    return headerHtml('Return') + bannerHtml() + '<main>' +
+      '<form id="return-find"><input id="return-waybill" placeholder="Scan the waybill" value="' + esc(S.returnWaybill || '') + '">' +
+      '<button type="submit">Open</button></form>' +
+      lines +
+      (view ? '<button type="button" class="wide good" data-action="submit-return">Save return</button>' : '') +
+      '</main>';
+  }
+
+  function receiveHtml() {
+    var query = String(S.receiveCode || '').toUpperCase();
+    var matches = (S.model && S.model.items || []).filter(function (item) {
+      if (item.active === false) return false;
+      if (!query) return false;
+      return String(item.sku || '').toUpperCase().indexOf(query) >= 0
+        || String(item.barcode || '').toUpperCase().indexOf(query) >= 0
+        || String(item.productName || '').toUpperCase().indexOf(query) >= 0;
+    }).slice(0, 8);
+    var list = matches.map(function (item) {
+      var print = item.barcode ? '' : '<button type="button" data-action="print-one" data-sku="' + esc(item.sku) + '">Print SKU label</button>';
+      return '<button type="button" class="ghost" data-action="pick-receive" data-sku="' + esc(item.sku) + '" data-client="' + esc(item.client) + '">' +
+        esc(item.sku) + ' · ' + esc(item.client) + (item.barcode ? ' · ' + esc(item.barcode) : ' · no barcode') + '</button>' + print;
+    }).join('');
+    return headerHtml('Receive') + bannerHtml() + '<main>' +
+      '<form id="receive-form"><input id="receive-code" placeholder="Scan barcode or search SKU" value="' + esc(S.receiveCode || '') + '">' +
+      '<input id="receive-qty" type="number" min="1" value="1" placeholder="Qty">' +
+      '<input id="receive-ref" placeholder="DR or PO number">' +
+      '<button type="submit">Add to stock</button></form>' +
+      list + '</main>';
+  }
+
+  function openReturn(code) {
+    var no = L.normWaybill(code);
+    if (!S.payload) refreshViews();
+    var view = S.payload && S.payload.waybills[no];
+    S.returnWaybill = no;
+    if (!view) {
+      S.banner = { kind: 'bad', text: L.MSG.UNKNOWN_WB };
+    } else if (L.needsReturnScan({ waybillNo: no, jtStatus: view.jtStatus }, [])) {
+      S.banner = { kind: 'warn', text: 'For return scan' };
+    }
+    render();
+  }
+
+  function submitReturn() {
+    var no = S.returnWaybill;
+    var view = S.payload && S.payload.waybills[no];
+    if (!view) return;
+    var known = (view.lines || []).filter(function (line) { return !line.unknown; });
+    var lines = known.map(function (line, index) {
+      var good = document.querySelector('[data-good="' + index + '"]');
+      var damaged = document.querySelector('[data-damaged="' + index + '"]');
+      var reason = document.querySelector('[data-reason="' + index + '"]');
+      return {
+        sku: line.sku,
+        good: good ? good.value : line.expected,
+        damaged: damaged ? damaged.value : 0,
+        reason: reason ? reason.value : 'RTS'
+      };
+    });
+    var event = { action: 'RETURN', stage: 'RETURN', waybill: no, lines: lines, scannedAt: new Date().toISOString() };
+    var plan = L.planStockMove(S.model, S.staff, event, new Date());
+    S.banner = { kind: plan.applied.result === 'OK' ? 'good' : 'bad', text: plan.applied.message };
+    enqueue(event, plan.applied.result === 'OK');
+    S.returnWaybill = '';
+    render();
+  }
+
+  function submitReceive() {
+    var code = ($('receive-code') && $('receive-code').value) || S.receiveCode || '';
+    var qty = $('receive-qty') ? $('receive-qty').value : 1;
+    var ref = $('receive-ref') ? $('receive-ref').value : '';
+    var event = { action: 'RECEIVE', stage: 'RECEIVE', code: code, sku: code, qty: qty, ref: ref, scannedAt: new Date().toISOString() };
+    var plan = L.planStockMove(S.model, S.staff, event, new Date());
+    S.banner = { kind: plan.applied.result === 'OK' ? 'good' : 'bad', text: plan.applied.message };
+    if (plan.applied.result === 'OK') enqueue(event, true);
+    render();
+  }
+
+  function assignBarcodes() {
+    if (!L.roleCanUseAdmin(S.staff)) return;
+    var updates = L.assignMissingBarcodes(S.model.items || []);
+    if (!updates.length) {
+      S.banner = { kind: 'good', text: 'Every item already has a barcode.' };
+      render();
+      return;
+    }
+    if (!S.token || !S.online) {
+      S.banner = { kind: 'bad', text: 'Stay online to assign barcodes.' };
+      render();
+      return;
+    }
+    var chain = Promise.resolve();
+    updates.forEach(function (row) {
+      if (!row._row) return;
+      chain = chain.then(function () { return writeValues('ITEMS!D' + row._row, [[row.barcode]]); });
+    });
+    chain.then(function () { return loadSheet(); }).then(function () {
+      S.banner = { kind: 'good', text: 'Assigned ' + updates.length + ' barcodes. Existing ones were kept.' };
+      render();
+    }).catch(function () {
+      S.banner = { kind: 'bad', text: 'Could not write the barcodes.' };
+      render();
+    });
+  }
+
+  function saveBarcodeEdit() {
+    var sku = $('barcode-sku') ? $('barcode-sku').value : '';
+    var value = $('barcode-value') ? $('barcode-value').value : '';
+    var item = (S.model.items || []).filter(function (row) {
+      return String(row.sku).toUpperCase() === String(sku).trim().toUpperCase();
+    })[0];
+    if (!item) {
+      S.banner = { kind: 'bad', text: 'SKU was not found.' };
+      render();
+      return;
+    }
+    var check = L.saveBarcode(S.model.items, item.sku, item.client, value);
+    if (!check.ok) {
+      S.banner = { kind: 'bad', text: check.message };
+      render();
+      return;
+    }
+    if (!item._row || !S.token || !S.online) {
+      S.banner = { kind: 'bad', text: 'Stay online to save the barcode.' };
+      render();
+      return;
+    }
+    writeValues('ITEMS!D' + item._row, [[check.barcode]]).then(function () { return loadSheet(); }).then(function () {
+      S.banner = { kind: 'good', text: 'Barcode saved.' };
+      render();
+    }).catch(function () {
+      S.banner = { kind: 'bad', text: 'Could not save the barcode.' };
+      render();
+    });
+  }
+
   function go(target) {
     stopCamera();
     S.banner = null;
@@ -928,6 +1098,25 @@
         render();
         return;
       }
+    }
+    if (target === 'return') {
+      S.screen = 'return';
+      S.returnWaybill = '';
+      S.returnLines = [];
+      render();
+      return;
+    }
+    if (target === 'receive') {
+      if (!L.canReceive(S.staff)) {
+        S.banner = { kind: 'bad', text: 'You cannot receive stock.' };
+        S.screen = 'home';
+        render();
+        return;
+      }
+      S.screen = 'receive';
+      S.receiveCode = '';
+      render();
+      return;
     }
     if (target === 'admin') {
       if (!L.roleCanUseAdmin(S.staff)) {
@@ -1312,6 +1501,18 @@
     if (!el) return;
     if (el.getAttribute('data-go')) go(el.getAttribute('data-go'));
     else if (el.getAttribute('data-action') === 'approve-map') approveMap(el);
+    else if (el.getAttribute('data-action') === 'submit-return') submitReturn();
+    else if (el.getAttribute('data-action') === 'assign-barcodes') assignBarcodes();
+    else if (el.getAttribute('data-action') === 'print-one') {
+      S.labelOn = {};
+      S.labelOn[el.getAttribute('data-sku')] = true;
+      go('labels');
+    }
+    else if (el.getAttribute('data-action') === 'pick-receive') {
+      S.receiveCode = el.getAttribute('data-sku');
+      var input = $('receive-code');
+      if (input) input.value = S.receiveCode;
+    }
     else if (el.getAttribute('data-action') === 'toggle-resolved') {
       S.showResolved = !S.showResolved;
       render();
@@ -1352,6 +1553,21 @@
   });
 
   document.body.addEventListener('submit', function (event) {
+    if (event.target && event.target.id === 'return-find') {
+      event.preventDefault();
+      openReturn($('return-waybill') ? $('return-waybill').value : '');
+      return;
+    }
+    if (event.target && event.target.id === 'receive-form') {
+      event.preventDefault();
+      submitReceive();
+      return;
+    }
+    if (event.target && event.target.id === 'barcode-form') {
+      event.preventDefault();
+      saveBarcodeEdit();
+      return;
+    }
     if (!event.target || event.target.id !== 'scan-form') return;
     event.preventDefault();
     var input = $('code-input');
