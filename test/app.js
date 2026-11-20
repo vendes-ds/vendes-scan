@@ -169,6 +169,7 @@
 
   function enqueue(event, accepted) {
     event.localId = 'L' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    event.scannedAt = new Date().toISOString();
     S.queue.push({ localId: event.localId, event: event, phase: 'new', accepted: !!accepted });
     saveQueue();
     refreshViews();
@@ -217,6 +218,12 @@
         settings: []
       });
       return api('/values/' + encodeURIComponent('SETTINGS!A:B')).then(function (sheet) {
+        tables.SETTINGS = L.rowsToRecords(sheet.values || [], L.SHEETS.SETTINGS.fields);
+      }).catch(function () {}).then(function () {
+        return api('/values/' + encodeURIComponent('TO_MAP!A:J')).then(function (sheet) {
+          tables.TO_MAP = L.rowsToRecords(sheet.values || [], L.SHEETS.TO_MAP.fields, L.SHEETS.TO_MAP.headers);
+        }).catch(function () { tables.TO_MAP = []; });
+      }).then(function () {
         S.model = L.hydrateModel({
           staff: tables.STAFF,
           items: tables.ITEMS,
@@ -225,9 +232,10 @@
           scans: tables.SCANS,
           flags: tables.FLAGS,
           ledger: tables.LEDGER,
-          settings: L.rowsToRecords(sheet.values || [], L.SHEETS.SETTINGS.fields)
+          settings: tables.SETTINGS || [],
+          toMap: tables.TO_MAP || []
         });
-      }).catch(function () {}).then(function () {
+      }).then(function () {
         saveCache();
       });
     });
@@ -495,11 +503,13 @@
         esc(list.slice(0, 3).map(function (item) { return L.clipDisplay(item); }).join('  ')) +
         '</div></div><b>' + list.length + '</b></div>';
     }).join('');
-    var flags = (S.dash.flags || []).map(function (flag) {
+    var flagRows = (S.dash.flags || []).slice();
+    if (S.showResolved) flagRows = flagRows.concat(S.dash.resolvedFlags || []);
+    var flags = flagRows.map(function (flag) {
       var text = L.adminCardText(flag);
       return '<article class="flag"><div class="flag-top"><span class="flag-type">' + esc(text.type) + '</span>' +
         '<button type="button" data-resolve="1" data-row="' + esc(flag._row || '') + '" data-ts="' + esc(flag.timestamp) +
-        '" data-wb="' + esc(flag.waybillKey || flag.waybill) + '" data-type="' + esc(flag.type) + '">Resolved</button></div>' +
+        '" data-wb="' + esc(flag.waybillKey || flag.waybill) + '" data-type="' + esc(flag.type) + '">' + (flag.resolved ? 'Resolved' : 'Mark resolved') + '</button></div>' +
         '<b>' + esc(text.waybill) + '</b> · ' + esc(text.client) +
         '<p>' + esc(text.details) + '</p></article>';
     }).join('') || '<p class="hint">No open flags.</p>';
@@ -507,12 +517,85 @@
       '<h2>Today · ' + esc(L.clipDisplay(S.dash.today)) + '</h2>' +
       '<p class="hint" title="A count is waybills that finished that stage today. A shortage is shown beside the count, not inside it.">Waybills that finished the stage today. Shortages are counted apart.</p>' +
       '<div class="tiles">' + tiles + '</div>' +
-      '<h2>Open flags</h2>' + flags +
+      mapQueueHtml() +
+      '<h2>Open flags</h2>' +
+      '<button type="button" class="ghost" data-action="toggle-resolved">' + (S.showResolved ? 'Hide resolved' : 'Show resolved') + '</button>' +
+      flags +
       '<h2>Backlog</h2>' + backlog +
       '<h2>Who did each stage</h2>' + ownersHtml() +
       '<p class="note">J&amp;T import still runs from the Google Sheet menu. Stock changes only there.</p>' +
       '<button type="button" class="wide" data-go="jt">Import J&T export</button>' +
       '<button type="button" class="wide" data-go="labels">Print SKU labels</button></main>';
+  }
+
+  function pendingMaps() {
+    return ((S.model && S.model.toMap) || []).filter(function (row) {
+      return String(row.status || '').toUpperCase() === 'PENDING';
+    });
+  }
+
+  function mapQueueHtml() {
+    var rows = pendingMaps();
+    if (!rows.length || !S.staff || !L.roleCanUseAdmin(S.staff)) return '';
+    return '<div class="banner bad" role="alert"><span>' + rows.length + ' items need a SKU mapping</span></div>' +
+      rows.map(function (row, index) {
+        var options = (S.model.items || []).filter(function (item) {
+          return item.active !== false && String(item.client || '').toUpperCase() === String(row.client || '').toUpperCase();
+        }).map(function (item) {
+          var selected = String(item.sku || '').toUpperCase() === String(row.suggestedSku || '').toUpperCase();
+          return '<option' + (selected ? ' selected' : '') + '>' + esc(item.sku) + '</option>';
+        }).join('');
+        return '<div class="card"><b>' + esc(row.token) + '</b><p class="hint">' + esc(row.client) +
+          ' · ' + (row.waybillCount || 1) + ' waybill(s)</p>' +
+          '<select data-map="' + index + '" style="width:100%;height:44px;margin:8px 0">' + options + '</select>' +
+          '<button type="button" class="wide" data-action="approve-map" data-map="' + index + '">Approve SKU</button></div>';
+      }).join('');
+  }
+
+  function approveMap(el) {
+    var index = Number(el.getAttribute('data-map'));
+    var row = pendingMaps()[index];
+    var select = document.querySelector('select[data-map="' + index + '"]');
+    var sku = select ? select.value : '';
+    if (!row || !sku) return;
+    if (!S.token || !S.online) {
+      setBanner({ kind: 'bad', text: 'Stay online to approve a mapping.' }, true);
+      render();
+      return;
+    }
+    row.approvedSku = sku;
+    var plan = L.applyApprovedMappings(S.model, new Date(), S.staff && S.staff.email);
+    var chain = writeValues('SKU_MAP!D1', [['Qty']]).then(function () {
+      return appendRows('SKU_MAP', plan.skuMapAdded || []);
+    });
+    (plan.toMap || []).forEach(function (item) {
+      if (!item._row) return;
+      chain = chain.then(function () {
+        var values = L.recordsToMatrix([item], L.SHEETS.TO_MAP.fields);
+        return writeValues('TO_MAP!A' + item._row, values);
+      });
+    });
+    (plan.waybills || []).forEach(function (item) {
+      if (!item._row) return;
+      chain = chain.then(function () {
+        return writeValues('WAYBILLS!C' + item._row, [[item.itemString || '']]);
+      }).then(function () {
+        return writeValues('WAYBILLS!K' + item._row, [[item.unmapped || '']]);
+      });
+    });
+    (plan.flags || []).forEach(function (item) {
+      if (!item._row) return;
+      chain = chain.then(function () {
+        return writeValues('FLAGS!G' + item._row, [[true]]);
+      });
+    });
+    chain.then(function () { return loadSheet(); }).then(function () {
+      S.banner = { kind: 'good', text: 'Mapping saved. Pick is open once the item is on the waybill.' };
+      if (S.screen === 'admin') render();
+    }).catch(function () {
+      setBanner({ kind: 'bad', text: 'Could not save the mapping.' }, true);
+      render();
+    });
   }
 
   function ownersHtml() {
@@ -663,6 +746,7 @@
       }
     });
     chain = chain.then(function () { return appendRows('FLAGS', plan.flags || []); });
+    chain = chain.then(function () { return appendRows('TO_MAP', plan.toMap || []); });
     chain.then(function () {
       S.jtBusy = false;
       S.jtMessage = 'Wrote ' + inserts.length + ' new waybills and ' + (plan.updates || []).length + ' status updates.';
@@ -1227,6 +1311,11 @@
     var el = event.target.closest('[data-go], [data-action], [data-resolve]');
     if (!el) return;
     if (el.getAttribute('data-go')) go(el.getAttribute('data-go'));
+    else if (el.getAttribute('data-action') === 'approve-map') approveMap(el);
+    else if (el.getAttribute('data-action') === 'toggle-resolved') {
+      S.showResolved = !S.showResolved;
+      render();
+    }
     else if (el.getAttribute('data-action') === 'signin') signIn();
     else if (el.getAttribute('data-action') === 'camera') startCamera();
     else if (el.getAttribute('data-action') === 'short') submitShort();
@@ -1292,17 +1381,46 @@
     wireInstall();
   });
 
-  window.addEventListener('online', function () {
-    if (params.get('offline') === '1') return;
-    S.online = true;
-    paint();
-    syncNow();
-  });
+  function loadGis() {
+    if (params.get('offline') === '1' || S.demo) return;
+    if (window.google && google.accounts) {
+      if (!S.tokenClient) initGis();
+      var ready = readToken();
+      if (ready && !S.token) S.token = ready;
+      if (S.token && !S.model) afterToken();
+      else syncNow();
+      return;
+    }
+    if (S.gisLoading) return;
+    S.gisLoading = true;
+    var script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.onload = function () {
+      S.gisLoading = false;
+      initGis();
+      var token = readToken();
+      if (token) {
+        S.token = token;
+        if (!S.model) afterToken();
+        else syncNow();
+      }
+    };
+    script.onerror = function () { S.gisLoading = false; };
+    document.head.appendChild(script);
+  }
 
-  window.addEventListener('offline', function () {
-    S.online = false;
-    paint();
-  });
+  function noteConnection() {
+    if (params.get('offline') === '1') return;
+    var online = navigator.onLine !== false;
+    var changed = online !== S.online;
+    S.online = online;
+    if (changed) paint();
+    if (online && pendingCount()) loadGis();
+  }
+
+  window.addEventListener('online', noteConnection);
+  window.addEventListener('offline', noteConnection);
+  setInterval(noteConnection, 15000);
 
   function watchServiceWorker() {
     if (!('serviceWorker' in navigator)) return;
@@ -1344,19 +1462,7 @@
       S.screen = 'signin';
       render();
     }
-    if (!S.online) return;
-    var script = document.createElement('script');
-    script.src = 'https://accounts.google.com/gsi/client';
-    script.onload = function () {
-      initGis();
-      var token = readToken();
-      if (token) {
-        S.token = token;
-        afterToken();
-      }
-    };
-    script.onerror = function () {};
-    document.head.appendChild(script);
+    if (S.online) loadGis();
   }
 
   boot();
