@@ -396,7 +396,6 @@
   }
 
   function headerHtml(tag) {
-    S.online = browserOnline();
     var back = '<span class="back-spacer"></span>';
     if (S.screen !== 'home' && S.screen !== 'denied' && S.screen !== 'signin' && S.screen !== 'setup' && S.screen !== 'loading') {
       back = '<button type="button" class="back" data-go="home">Back</button>';
@@ -504,7 +503,7 @@
   }
 
   function adminHtml() {
-    if (!S.dash) return headerHtml('Admin') + '<main><p class="hint">Loading dashboard…</p></main>';
+    if (!S.dash) return headerHtml('Admin') + bannerHtml() + '<main><p class="hint">Loading dashboard…</p></main>';
     var counts = S.dash.counts || {};
     var tiles = [['PICK', 'Pick'], ['PACK', 'Pack'], ['DISPATCH', 'Dispatch'], ['PICKUP', 'Pickup']].map(function (pair) {
       var short = counts[pair[0] + '_SHORT'] || 0;
@@ -534,7 +533,7 @@
         '<b>' + esc(text.waybill) + '</b> · ' + esc(text.client) +
         '<p>' + esc(text.details) + '</p></article>';
     }).join('') || '<p class="hint">No open flags.</p>';
-    return headerHtml('Admin') + '<main>' +
+    return headerHtml('Admin') + bannerHtml() + '<main>' +
       '<h2>Today · ' + esc(L.clipDisplay(S.dash.today)) + '</h2>' +
       '<p class="hint" title="A count is waybills that finished that stage today. A shortage is shown beside the count, not inside it.">Waybills that finished the stage today. Shortages are counted apart.</p>' +
       '<div class="tiles">' + tiles + '</div>' +
@@ -1653,12 +1652,8 @@
     document.head.appendChild(script);
   }
 
-  function noteConnection() {
-    if (params.get('offline') === '1') {
-      S.online = false;
-      return;
-    }
-    var online = browserOnline();
+  function markOnline(online) {
+    if (params.get('offline') === '1') online = false;
     var changed = online !== S.online;
     S.online = online;
     var pill = $('save-pill');
@@ -1670,9 +1665,21 @@
     if (online && pendingCount()) loadGis();
   }
 
-  window.addEventListener('online', noteConnection);
-  window.addEventListener('offline', noteConnection);
-  setInterval(noteConnection, 15000);
+  function probeOnline() {
+    if (params.get('offline') === '1' || (typeof navigator !== 'undefined' && navigator.onLine === false)) {
+      markOnline(false);
+      return;
+    }
+    fetch('online-check?ts=' + Date.now(), { cache: 'no-store', method: 'GET' }).then(function () {
+      markOnline(true);
+    }).catch(function () {
+      markOnline(false);
+    });
+  }
+
+  window.addEventListener('online', probeOnline);
+  window.addEventListener('offline', probeOnline);
+  setInterval(probeOnline, 3000);
 
   function watchServiceWorker() {
     if (!('serviceWorker' in navigator)) return;
@@ -1714,7 +1721,7 @@
       S.screen = 'signin';
       render();
     }
-    noteConnection();
+    probeOnline();
     if (S.online) loadGis();
   }
 
